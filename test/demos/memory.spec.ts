@@ -1,6 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { INestApplication, ValidationPipe } from '@nestjs/common';
-import request from 'supertest';
 import { AppModule } from './../../src/app.module';
 import dotenv from 'dotenv';
 
@@ -19,11 +18,48 @@ describe('Memory Demo (对话记忆)', () => {
     app.enableCors();
     app.useGlobalPipes(new ValidationPipe({ transform: true, whitelist: true }));
     await app.init();
+    await app.listen(0);
   }, 30000);
 
   afterAll(async () => {
     await app.close();
   });
+
+  async function streamQuery(prompt: string, options: any) {
+    const server = app.getHttpServer();
+    const address = server.address() as any;
+    const serverUrl = `http://127.0.0.1:${address.port}`;
+
+    const response = await fetch(`${serverUrl}/api/query`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt, options }),
+    });
+
+    const reader = response.body?.getReader();
+    const decoder = new TextDecoder();
+    let fullText = '';
+
+    if (reader) {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        const chunk = decoder.decode(value, { stream: true });
+        fullText += chunk;
+
+        // 实时打印每个 SSE 数据块
+        const lines = chunk.split('\n');
+        for (const line of lines) {
+          if (line.startsWith('data:')) {
+            console.log(line);
+          }
+        }
+      }
+    }
+
+    return fullText;
+  }
 
   it('应该记住对话上下文，知道用户是小明', async () => {
     const envConfig = {
@@ -37,44 +73,19 @@ describe('Memory Demo (对话记忆)', () => {
     console.log('第一轮：告诉 AI "我是小明"');
     console.log('================================\n');
 
-    // 第一句话：告诉 AI 我是小明
-    const res1 = await request(app.getHttpServer())
-      .post('/api/query')
-      .send({
-        prompt: '我是小明，请记住这个名字。',
-        options: { env: envConfig }
-      })
-      .expect('Content-Type', /text\/event-stream/);
+    const text1 = await streamQuery('我是小明，请记住这个名字。', { env: envConfig });
+    expect(text1).toContain('data:');
+    expect(text1).toContain('done');
 
-    console.log('---------- Response 1 ----------');
-    console.log(res1.text);
-    console.log('----------------------------------\n');
-
-    expect(res1.text).toContain('data:');
-    expect(res1.text).toContain('done');
-
-    console.log('第二轮：问 AI "我是谁？"（使用 continue 继续对话）');
+    console.log('\n第二轮：问 AI "我是谁？"（使用 continue 继续对话）');
     console.log('================================\n');
 
-    // 第二句话：问 AI 我是谁（使用 continue 继续对话）
-    const res2 = await request(app.getHttpServer())
-      .post('/api/query')
-      .send({
-        prompt: '我是谁？请简短回答。',
-        options: { continue: true, env: envConfig }
-      })
-      .expect('Content-Type', /text\/event-stream/);
+    const text2 = await streamQuery('我是谁？请简短回答。', { continue: true, env: envConfig });
+    expect(text2).toContain('data:');
+    expect(text2).toContain('done');
+    expect(text2).toMatch(/小明|Xiaoming|xiaoming/);
 
-    console.log('---------- Response 2 ----------');
-    console.log(res2.text);
-    console.log('----------------------------------\n');
-
-    expect(res2.text).toContain('data:');
-    expect(res2.text).toContain('done');
-    // 断言：AI 应该知道用户是小明
-    expect(res2.text).toMatch(/小明|Xiaoming|xiaoming/);
-
-    console.log('✅ AI 记住了用户是小明！');
+    console.log('\n✅ AI 记住了用户是小明！');
     console.log('================================\n');
   });
 });
