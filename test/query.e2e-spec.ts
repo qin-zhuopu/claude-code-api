@@ -73,25 +73,5 @@ describe('Query API (e2e)', () => {
       expect(res.text).toContain('data:');
       expect(res.text).toMatch(/Not logged in|authentication/i);
     });
-
-    it('应该使用系统环境变量调用 Claude API 并返回 SSE 流', async () => {
-      const res = await request(app.getHttpServer())
-        .post('/api/query')
-        .send({
-          prompt: 'What is 2+2? Answer in one short sentence.',
-          options: {
-            env: {
-              ANTHROPIC_AUTH_TOKEN: process.env.ANTHROPIC_AUTH_TOKEN,
-              ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL,
-              API_TIMEOUT_MS: process.env.API_TIMEOUT_MS,
-              CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC,
-            }
-          }
-        })
-        .expect('Content-Type', /text\/event-stream/);
-
-      expect(res.text).toContain('data:');
-      expect(res.text).toContain('done');
-    });
   });
 });

@@ -11,7 +11,8 @@
     "start:prod": "node dist/main",
     "test": "jest",
     "test:e2e": "vitest --config ./test/vitest.e2e.config.ts --run",
-    "test:e2e:watch": "vitest --config ./test/vitest.e2e.config.ts"
+    "test:e2e:watch": "vitest --config ./test/vitest.e2e.config.ts",
+    "test:api": "vitest --config ./test/vitest.api.config.ts --run"
   },
   "keywords": [
     "claude",
