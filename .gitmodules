@@ -1,0 +1,3 @@
+[submodule "repos/CodePilot"]
+	path = repos/CodePilot
+	url = https://github.com/op7418/CodePilot
