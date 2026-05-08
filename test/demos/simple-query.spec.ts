@@ -26,6 +26,10 @@ describe('Simple Query Demo (简单查询)', () => {
   });
 
   it('应该使用 .env 配置调用 Claude API 并返回 SSE 流', async () => {
+    console.log('\n========== Simple Query Demo ==========');
+    console.log('Prompt: What is 2+2?');
+    console.log('======================================\n');
+
     const res = await request(app.getHttpServer())
       .post('/api/query')
       .send({
@@ -40,6 +44,10 @@ describe('Simple Query Demo (简单查询)', () => {
         }
       })
       .expect('Content-Type', /text\/event-stream/);
+
+    console.log('========== Response ==========');
+    console.log(res.text);
+    console.log('================================\n');
 
     expect(res.text).toContain('data:');
     expect(res.text).toContain('done');

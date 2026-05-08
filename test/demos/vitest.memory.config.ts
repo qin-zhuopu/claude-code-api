@@ -7,5 +7,7 @@ export default defineConfig({
     testTimeout: 120000,
     globals: true,
     bail: 1,
+    reporters: ['verbose'],
+    printConsoleTrace: true,
   },
 });
