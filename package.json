@@ -10,8 +10,8 @@
     "start:debug": "nest start --debug --watch",
     "start:prod": "node dist/main",
     "test": "vitest --run",
-    "test:e2e": "vitest --config ./test/e2e/vitest.config.ts --run",
-    "test:e2e:watch": "vitest --config ./test/e2e/vitest.config.ts",
+    "test:integration": "vitest --config ./test/integration/vitest.config.ts --run",
+    "test:integration:watch": "vitest --config ./test/integration/vitest.config.ts",
     "demo:simple-query": "vitest --config ./test/demos/vitest.simple-query.config.ts --run",
     "demo:memory": "vitest --config ./test/demos/vitest.memory.config.ts --run"
   },
