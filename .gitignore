@@ -33,6 +33,11 @@ coverage/
 *.tmp
 .claude-trace/
 
+# Claude Code
+.agents/
+.claude/skills/
+skills-lock.json
+
 
 # Project specific
 .obsidian/
