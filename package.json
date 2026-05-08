@@ -9,9 +9,10 @@
     "start:dev": "nest start --watch",
     "start:debug": "nest start --debug --watch",
     "start:prod": "node dist/main",
+    "test": "vitest --run",
     "test:e2e": "vitest --config ./test/vitest.e2e.config.ts --run",
     "test:e2e:watch": "vitest --config ./test/vitest.e2e.config.ts",
-    "test:api": "vitest --config ./test/vitest.api.config.ts --run"
+    "test:demos": "vitest --config ./test/vitest.api.config.ts --run"
   },
   "keywords": [
     "claude",
