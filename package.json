@@ -12,7 +12,8 @@
     "test": "vitest --run",
     "test:e2e": "vitest --config ./test/vitest.e2e.config.ts --run",
     "test:e2e:watch": "vitest --config ./test/vitest.e2e.config.ts",
-    "test:demos": "vitest --config ./test/vitest.api.config.ts --run"
+    "demo:simple-query": "vitest --config ./test/vitest.demo.simple-query.config.ts --run",
+    "demo:memory": "vitest --config ./test/vitest.demo.memory.config.ts --run"
   },
   "keywords": [
     "claude",

@@ -2,10 +2,10 @@ import { defineConfig } from 'vitest/config';
 
 export default defineConfig({
   test: {
-    include: ['test/**/*.e2e-spec.ts'],
-    exclude: ['**/node_modules/**', '**/repos/**', '**/demo.*.e2e-spec.ts'],
+    include: ['**/demo.memory.e2e-spec.ts'],
     environment: 'node',
     testTimeout: 120000,
+    rootDir: '.',
     globals: true,
     bail: 1,
   },
