@@ -20,6 +20,11 @@ async function bootstrap() {
 
   const port = process.env.PORT || 3000;
   await app.listen(port);
-  console.log(`Application is running on: http://localhost:${port}`);
+
+  // 获取实际监听的端口（当 port=0 时，系统会分配随机端口）
+  const server = app.getHttpServer();
+  const address = server.address();
+  const actualPort = typeof address === 'string' ? address : address?.port;
+  console.log(`Application is running on http://localhost:${actualPort}`);
 }
 bootstrap();

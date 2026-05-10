@@ -12,10 +12,11 @@
     "test": "vitest --run",
     "test:integration": "vitest --config ./test/integration/vitest.config.ts --run",
     "test:integration:watch": "vitest --config ./test/integration/vitest.config.ts",
-    "demo": "echo '\\n📋 Available demos:\\n  npm run demo:simple-query       - Simple query demo\\n  npm run demo:memory            - Conversation memory demo\\n  npm run demo:stream           - Real-time streaming demo (需先启动服务器)\\n  npm run demo:claude-code-intro - Claude Code introduction (1000+ words, no tools)\\n'",
+    "test:integration:list": "echo '\\n📋 集成测试用例文件:\\n  events.spec.ts       - SSE 流式输出测试\\n  query-stream.spec.ts - LLM 流式输出测试\\n\\n运行命令: npm run test:integration -- <文件名>\\n\\n示例:\\n  npm run test:integration -- events.spec\\n  npm run test:integration -- query-stream.spec\\n  npm run test:integration -- --reporter=verbose query-stream.spec\\n'",
+    "demo": "echo '\\n📋 Available demos:\\n  npm run demo:simple-query       - Simple query demo\\n  npm run demo:memory            - Conversation memory demo\\n  npm run demo:stream           - 实时流式输出 (需先启动服务器)\\n  npm run demo:claude-code-intro - Claude Code introduction (1000+ words, no tools)\\n\\n💡 提示: 运行 demo:stream 前，先执行: npm run start:dev'",
     "demo:simple-query": "vitest --config ./test/demos/vitest.simple-query.config.ts --run",
     "demo:memory": "vitest --config ./test/demos/vitest.memory.config.ts --run",
-    "demo:stream": "node test/demos/stream-demo-simple.mjs",
+    "demo:stream": "npx tsx test/demos/stream-demo.ts",
     "demo:claude-code-intro": "vitest --config ./test/demos/vitest.claude-code-intro.config.ts --run"
   },
   "keywords": [

@@ -8,5 +8,7 @@ export default defineConfig({
     testTimeout: 60000,
     globals: true,
     bail: 1,
+    fileParallelism: false,
+    singleThread: true,
   },
 });
