@@ -12,8 +12,11 @@
     "test": "vitest --run",
     "test:integration": "vitest --config ./test/integration/vitest.config.ts --run",
     "test:integration:watch": "vitest --config ./test/integration/vitest.config.ts",
+    "demo": "echo '\\n📋 Available demos:\\n  npm run demo:simple-query       - Simple query demo\\n  npm run demo:memory            - Conversation memory demo\\n  npm run demo:stream           - Real-time streaming demo (需先启动服务器)\\n  npm run demo:claude-code-intro - Claude Code introduction (1000+ words, no tools)\\n'",
     "demo:simple-query": "vitest --config ./test/demos/vitest.simple-query.config.ts --run",
-    "demo:memory": "vitest --config ./test/demos/vitest.memory.config.ts --run"
+    "demo:memory": "vitest --config ./test/demos/vitest.memory.config.ts --run",
+    "demo:stream": "node test/demos/stream-demo-simple.mjs",
+    "demo:claude-code-intro": "vitest --config ./test/demos/vitest.claude-code-intro.config.ts --run"
   },
   "keywords": [
     "claude",
