@@ -15,21 +15,35 @@
 每个 agent 是一个独立目录，安装到用户本地的 agents 仓库中：
 
 ```
-~/.jereh-agents/                          # agents 仓库根目录
-├── registry.json                         # 已安装 agent 的注册表
+~/.jereh-agents/                              # agents 仓库根目录
+├── registry.json                             # 已安装 agent 的注册表
 └── packages/
-    └── greeter/                          # agent 名称
-        ├── manifest.json                 # agent 元数据（版本、描述、作者等）
-        ├── agent.json                    # agent 定义（prompt、tools、skills 列表）
-        ├── skills/                       # agent 自带的 skill
-        │   ├── greet/
+    ├── greeter/                              # agent: 多语言问候
+    │   ├── manifest.json                     # 元数据（版本、描述、作者等）
+    │   ├── agent.json                        # agent 定义（prompt、tools、skills）
+    │   ├── skills/                           # agent 自带的 skill
+    │   │   ├── greet/
+    │   │   │   └── SKILL.md
+    │   │   └── joke/
+    │   │       └── SKILL.md
+    │   └── .lock                             # 版本锁定（来源、hash）
+    │
+    └── code-reviewer/                        # agent: 代码审查
+        ├── manifest.json
+        ├── agent.json
+        ├── skills/
+        │   ├── review-pr/
         │   │   └── SKILL.md
-        │   └── joke/
+        │   ├── security-scan/
+        │   │   └── SKILL.md
+        │   └── style-check/
         │       └── SKILL.md
-        └── .lock                         # 版本锁定文件（记录来源和 hash）
+        └── .lock
 ```
 
 ### manifest.json
+
+**greeter/manifest.json**
 
 ```json
 {
@@ -44,7 +58,24 @@
 }
 ```
 
+**code-reviewer/manifest.json**
+
+```json
+{
+  "name": "code-reviewer",
+  "version": "2.0.1",
+  "description": "Automated code review with security and style checks",
+  "author": "your-team",
+  "source": "https://registry.example.com/agents/code-reviewer",
+  "minSdkVersion": "0.2.130",
+  "skills": ["review-pr", "security-scan", "style-check"],
+  "tools": ["Skill", "Read", "Grep", "Glob", "Bash"]
+}
+```
+
 ### agent.json
+
+**greeter/agent.json**
 
 ```json
 {
@@ -54,6 +85,19 @@
   "skills": ["greet", "joke"],
   "model": "sonnet",
   "effort": "low"
+}
+```
+
+**code-reviewer/agent.json**
+
+```json
+{
+  "description": "Reviews code changes for bugs, security issues, and style violations",
+  "prompt": "You are a senior code reviewer. Analyze the code changes thoroughly. Use review-pr for general review, security-scan for security-focused analysis, and style-check for coding standards compliance.",
+  "tools": ["Skill", "Read", "Grep", "Glob", "Bash"],
+  "skills": ["review-pr", "security-scan", "style-check"],
+  "model": "sonnet",
+  "effort": "high"
 }
 ```
 
