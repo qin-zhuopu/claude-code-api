@@ -2,17 +2,12 @@
  * 变量控制法：观察 systemPrompt 各种配置对 API 请求中 system 字段的影响
  *
  * systemPrompt 类型：
- *   - 不设置（默认）
- *   - string（完全自定义）
- *   - string[]（多段自定义）
- *   - { type: 'preset', preset: 'claude_code' }（使用默认 Claude Code prompt）
- *   - { type: 'preset', preset: 'claude_code', append: '...' }（默认 + 追加）
- *   - { type: 'preset', preset: 'claude_code', excludeDynamicSections: true }（默认去除动态段）
- *
- * 每个用例的日志目录按编号区分：
- *   test/integration/tmp/system-prompt/case-1-default/
- *   test/integration/tmp/system-prompt/case-2-custom-string/
- *   ...
+ *   - 不设置（默认）→ 精简 SDK agent 身份
+ *   - string（自定义）→ 追加到基础身份之后
+ *   - string[]（多段自定义）→ 合并后追加
+ *   - { type: 'preset', preset: 'claude_code' }（完整 Claude Code prompt）
+ *   - { type: 'preset', preset: 'claude_code', append: '...' }（完整 + 追加）
+ *   - { type: 'preset', preset: 'claude_code', excludeDynamicSections: true }（去动态段）
  */
 import { describe, it, expect } from 'vitest';
 import { query } from '@anthropic-ai/claude-agent-sdk';
@@ -23,7 +18,6 @@ import { createTimestampDir, prettyFormatJsonFiles } from './helpers';
 
 dotenv.config();
 
-// --- 公共 env ---
 const BASE_ENV = {
   ANTHROPIC_AUTH_TOKEN: process.env.ANTHROPIC_AUTH_TOKEN_LOCAL,
   ANTHROPIC_BASE_URL: 'http://10.1.3.115:4000',
@@ -38,310 +32,269 @@ const BASE_ENV = {
   OTEL_TRACES_EXPORTER: 'none',
 };
 
+const CUSTOM_MARKER = 'JEREH_CUSTOM_MARKER_12345';
+
 // --- 辅助函数 ---
 
-interface SystemPromptAnalysis {
-  systemBlocks: Array<{ text: string; hasCacheControl: boolean }>;
-  systemBlockCount: number;
-  totalSystemChars: number;
-  containsClaudeCode: boolean;       // 是否包含 "Claude Code" 或 "Claude agent"
-  containsCustomText: boolean;       // 是否包含我们注入的自定义文本
-  customTextPosition: 'none' | 'only' | 'appended' | 'prepended';
-  userMessageText: string;           // user message 全文
-  userMessageBlockCount: number;
+interface SystemAnalysis {
+  blocks: Array<{ text: string; chars: number; cached: boolean }>;
+  blockCount: number;
+  totalChars: number;
+  // 内容检测
+  hasBillingHeader: boolean;
+  hasBaseIdentity: boolean;        // "You are a Claude agent..."
+  hasFullClaudeCode: boolean;      // 完整的 Claude Code 行为指令（>5000 chars）
+  hasCustomMarker: boolean;
+  hasGitStatus: boolean;           // 动态段：git status
+  // 位置分析
+  identityText: string;            // 身份声明的完整文本
+  customMarkerBlockIdx: number;    // 自定义内容在哪个 block
+  // user message
+  userBlocks: number;
+  userFirstBlockChars: number;
+  userHasGitStatus: boolean;       // 动态段是否移到了 user message
 }
 
-function analyzeSystemPrompt(apiBodyDir: string): SystemPromptAnalysis {
+function analyze(apiBodyDir: string): SystemAnalysis {
   const allFiles = readdirSync(apiBodyDir);
   const requestFiles = allFiles.filter(f => f.endsWith('.request.json'));
-  if (requestFiles.length === 0) {
-    return {
-      systemBlocks: [], systemBlockCount: 0, totalSystemChars: 0,
-      containsClaudeCode: false, containsCustomText: false,
-      customTextPosition: 'none', userMessageText: '', userMessageBlockCount: 0,
-    };
-  }
+  const empty: SystemAnalysis = {
+    blocks: [], blockCount: 0, totalChars: 0,
+    hasBillingHeader: false, hasBaseIdentity: false, hasFullClaudeCode: false,
+    hasCustomMarker: false, hasGitStatus: false,
+    identityText: '', customMarkerBlockIdx: -1,
+    userBlocks: 0, userFirstBlockChars: 0, userHasGitStatus: false,
+  };
+  if (requestFiles.length === 0) return empty;
 
   const firstFile = requestFiles.sort()[0];
   const content = readFileSync(join(apiBodyDir, firstFile), 'utf-8');
-  const requestBody = JSON.parse(content);
+  const body = JSON.parse(content);
 
-  // system 分析
-  const system: any[] = requestBody.system || [];
-  const systemBlocks = system.map((s: any) => ({
+  const system: any[] = body.system || [];
+  const blocks = system.map((s: any) => ({
     text: s.text || '',
-    hasCacheControl: !!s.cache_control,
+    chars: (s.text || '').length,
+    cached: !!s.cache_control,
   }));
-  const totalSystemChars = systemBlocks.reduce((sum, b) => sum + b.text.length, 0);
-  const allSystemText = systemBlocks.map(b => b.text).join('\n');
+  const totalChars = blocks.reduce((sum, b) => sum + b.chars, 0);
+  const allSystemText = blocks.map(b => b.text).join('\n');
 
-  const containsClaudeCode = /Claude Code|Claude agent|claude-code/i.test(allSystemText);
-  const CUSTOM_MARKER = 'JEREH_CUSTOM_MARKER';
-  const containsCustomText = allSystemText.includes(CUSTOM_MARKER);
+  const hasBillingHeader = blocks.some(b => b.text.includes('x-anthropic-billing-header'));
+  const hasBaseIdentity = blocks.some(b => /You are a Claude agent|You are Claude Code/i.test(b.text));
+  const hasFullClaudeCode = blocks.some(b => b.chars > 5000 && b.text.includes('interactive agent'));
+  const hasCustomMarker = allSystemText.includes(CUSTOM_MARKER);
+  const hasGitStatus = allSystemText.includes('gitStatus') || allSystemText.includes('git status');
 
-  // 判断自定义文本位置
-  let customTextPosition: SystemPromptAnalysis['customTextPosition'] = 'none';
-  if (containsCustomText) {
-    if (!containsClaudeCode) {
-      customTextPosition = 'only';
-    } else {
-      // 找到自定义文本在哪个 block
-      const customBlockIdx = systemBlocks.findIndex(b => b.text.includes(CUSTOM_MARKER));
-      const claudeBlockIdx = systemBlocks.findIndex(b => /Claude Code|Claude agent/i.test(b.text));
-      customTextPosition = customBlockIdx > claudeBlockIdx ? 'appended' : 'prepended';
-    }
-  }
+  const identityBlock = blocks.find(b => /You are a Claude agent|You are Claude Code/i.test(b.text));
+  const identityText = identityBlock?.text || '';
+  const customMarkerBlockIdx = blocks.findIndex(b => b.text.includes(CUSTOM_MARKER));
 
-  // user message 分析
-  const userMessage = requestBody.messages?.[0];
-  const userMessageText = userMessage?.content
-    ?.filter((block: any) => block.type === 'text')
-    ?.map((block: any) => block.text)
-    ?.join('\n') || '';
-  const userMessageBlockCount = userMessage?.content?.length || 0;
+  // user message
+  const userMsg = body.messages?.[0];
+  const userContent = userMsg?.content || [];
+  const userBlocks = userContent.length;
+  const userFirstBlockChars = userContent[0]?.text?.length || 0;
+  const userAllText = userContent.map((b: any) => b.text || '').join('\n');
+  const userHasGitStatus = userAllText.includes('gitStatus') || userAllText.includes('git status');
 
   return {
-    systemBlocks, systemBlockCount: systemBlocks.length, totalSystemChars,
-    containsClaudeCode, containsCustomText, customTextPosition,
-    userMessageText, userMessageBlockCount,
+    blocks, blockCount: blocks.length, totalChars,
+    hasBillingHeader, hasBaseIdentity, hasFullClaudeCode,
+    hasCustomMarker, hasGitStatus,
+    identityText, customMarkerBlockIdx,
+    userBlocks, userFirstBlockChars, userHasGitStatus,
   };
 }
 
-async function runQuery(options: any): Promise<string> {
+async function run(options: any): Promise<string> {
   const sdkQuery = query({ prompt: 'say hello', options });
-  let resultText = '';
-  for await (const message of sdkQuery) {
-    const msg = message as any;
-    if (msg.type === 'stream_event' && msg.event?.type === 'content_block_delta') {
-      const delta = msg.event.delta;
-      if (delta?.type === 'text_delta') process.stderr.write(delta.text);
+  let result = '';
+  for await (const msg of sdkQuery) {
+    const m = msg as any;
+    if (m.type === 'stream_event' && m.event?.type === 'content_block_delta') {
+      if (m.event.delta?.type === 'text_delta') process.stderr.write(m.event.delta.text);
     }
-    if (msg.type === 'result') resultText = msg.result || '';
+    if (m.type === 'result') result = m.result || '';
   }
-  return resultText;
+  return result;
 }
 
-// --- 测试用例 ---
+// --- 测试 ---
 
-describe('systemPrompt 配置对 API 请求的影响', () => {
+describe('systemPrompt 配置矩阵', () => {
 
-  // Case 1: 不设置 systemPrompt（默认）
-  it('case-1 默认: 不设置systemPrompt → SDK默认的精简prompt', async () => {
-    const apiBodyDir = createTimestampDir('system-prompt/case-1-default');
-    const result = await runQuery({
-      env: { ...BASE_ENV, OTEL_LOG_RAW_API_BODIES: `file:${apiBodyDir}` },
-      includePartialMessages: true,
-      persistSession: false,
-      settingSources: [],
-      effort: 'low',
-      tools: [],
+  it('case-1 不设置: 精简SDK身份(~146 chars)', async () => {
+    const dir = createTimestampDir('system-prompt/case-1-default');
+    await run({
+      env: { ...BASE_ENV, OTEL_LOG_RAW_API_BODIES: `file:${dir}` },
+      includePartialMessages: true, persistSession: false, settingSources: [], effort: 'low', tools: [],
     });
 
-    const analysis = analyzeSystemPrompt(apiBodyDir);
-    console.error('\n[case-1] systemBlockCount:', analysis.systemBlockCount);
-    console.error('[case-1] totalSystemChars:', analysis.totalSystemChars);
-    console.error('[case-1] containsClaudeCode:', analysis.containsClaudeCode);
-    console.error('[case-1] blocks:', analysis.systemBlocks.map(b => b.text.slice(0, 80)));
+    const a = analyze(dir);
+    console.error(`\n[case-1] ${a.blockCount} blocks, ${a.totalChars} chars`);
+    console.error(`[case-1] identity: "${a.identityText}"`);
 
-    // 默认应该有精简的 SDK agent 身份
-    expect(analysis.systemBlockCount).toBeGreaterThanOrEqual(2);
-    expect(analysis.containsClaudeCode).toBe(true);
-    expect(analysis.containsCustomText).toBe(false);
-    expect(result.trim().length).toBeGreaterThan(0);
+    expect(a.blockCount).toBe(2);
+    expect(a.hasBillingHeader).toBe(true);
+    expect(a.hasBaseIdentity).toBe(true);
+    expect(a.hasFullClaudeCode).toBe(false);
+    expect(a.totalChars).toBeLessThan(200);
 
-    prettyFormatJsonFiles(apiBodyDir);
+    prettyFormatJsonFiles(dir);
   }, 120000);
 
-  // Case 2: systemPrompt = 自定义字符串（完全替换）
-  it('case-2 自定义string: 完全替换默认prompt', async () => {
-    const apiBodyDir = createTimestampDir('system-prompt/case-2-custom-string');
-    const result = await runQuery({
-      env: { ...BASE_ENV, OTEL_LOG_RAW_API_BODIES: `file:${apiBodyDir}` },
-      includePartialMessages: true,
-      persistSession: false,
-      settingSources: [],
-      effort: 'low',
-      tools: [],
-      systemPrompt: 'You are a test bot. JEREH_CUSTOM_MARKER. Reply briefly.',
+  it('case-2 自定义string: 追加到基础身份之后(不替换)', async () => {
+    const dir = createTimestampDir('system-prompt/case-2-custom-string');
+    await run({
+      env: { ...BASE_ENV, OTEL_LOG_RAW_API_BODIES: `file:${dir}` },
+      includePartialMessages: true, persistSession: false, settingSources: [], effort: 'low', tools: [],
+      systemPrompt: `You are a test bot. ${CUSTOM_MARKER}. Reply briefly.`,
     });
 
-    const analysis = analyzeSystemPrompt(apiBodyDir);
-    console.error('\n[case-2] systemBlockCount:', analysis.systemBlockCount);
-    console.error('[case-2] totalSystemChars:', analysis.totalSystemChars);
-    console.error('[case-2] containsClaudeCode:', analysis.containsClaudeCode);
-    console.error('[case-2] containsCustomText:', analysis.containsCustomText);
-    console.error('[case-2] blocks:', analysis.systemBlocks.map(b => b.text.slice(0, 80)));
+    const a = analyze(dir);
+    console.error(`\n[case-2] ${a.blockCount} blocks, ${a.totalChars} chars`);
+    console.error(`[case-2] blocks: ${a.blocks.map(b => `${b.chars}c${b.cached ? '(cached)' : ''}`).join(', ')}`);
 
-    // 自定义字符串：SDK 仍保留 billing header 和基础身份，自定义内容追加在后面
-    expect(analysis.containsCustomText).toBe(true);
-    // 发现：自定义 string 不会完全替换，而是追加到默认的 billing + 身份之后
-    expect(analysis.containsClaudeCode).toBe(true);
-    expect(analysis.customTextPosition).toBe('appended');
-    // 但 system prompt 应该很短（不是完整的 Claude Code prompt）
-    expect(analysis.totalSystemChars).toBeLessThan(500);
-    expect(result.trim().length).toBeGreaterThan(0);
+    // 结构：billing + 基础身份 + 自定义内容
+    expect(a.blockCount).toBe(3);
+    expect(a.hasBillingHeader).toBe(true);
+    expect(a.hasBaseIdentity).toBe(true);       // 基础身份保留
+    expect(a.hasCustomMarker).toBe(true);       // 自定义内容追加
+    expect(a.customMarkerBlockIdx).toBe(2);     // 在第3个block
+    expect(a.hasFullClaudeCode).toBe(false);    // 不是完整 Claude Code prompt
+    expect(a.totalChars).toBeLessThan(300);
 
-    prettyFormatJsonFiles(apiBodyDir);
+    prettyFormatJsonFiles(dir);
   }, 120000);
 
-  // Case 3: systemPrompt = string[]（多段自定义）
-  it('case-3 自定义string[]: 多段自定义prompt', async () => {
-    const apiBodyDir = createTimestampDir('system-prompt/case-3-custom-array');
-    const result = await runQuery({
-      env: { ...BASE_ENV, OTEL_LOG_RAW_API_BODIES: `file:${apiBodyDir}` },
-      includePartialMessages: true,
-      persistSession: false,
-      settingSources: [],
-      effort: 'low',
-      tools: [],
-      systemPrompt: [
-        'You are a test bot.',
-        'JEREH_CUSTOM_MARKER',
-        'Reply in one sentence.',
-      ],
+  it('case-3 自定义string[]: 多段合并为一个block追加', async () => {
+    const dir = createTimestampDir('system-prompt/case-3-custom-array');
+    await run({
+      env: { ...BASE_ENV, OTEL_LOG_RAW_API_BODIES: `file:${dir}` },
+      includePartialMessages: true, persistSession: false, settingSources: [], effort: 'low', tools: [],
+      systemPrompt: ['You are a test bot.', CUSTOM_MARKER, 'Reply in one sentence.'],
     });
 
-    const analysis = analyzeSystemPrompt(apiBodyDir);
-    console.error('\n[case-3] systemBlockCount:', analysis.systemBlockCount);
-    console.error('[case-3] totalSystemChars:', analysis.totalSystemChars);
-    console.error('[case-3] containsClaudeCode:', analysis.containsClaudeCode);
-    console.error('[case-3] containsCustomText:', analysis.containsCustomText);
-    console.error('[case-3] blocks:', analysis.systemBlocks.map(b => b.text.slice(0, 80)));
+    const a = analyze(dir);
+    console.error(`\n[case-3] ${a.blockCount} blocks, ${a.totalChars} chars`);
 
-    // 多段自定义：同 case-2，SDK 仍保留 billing + 身份，自定义内容合并为一个 block 追加
-    expect(analysis.containsCustomText).toBe(true);
-    expect(analysis.containsClaudeCode).toBe(true);
-    expect(result.trim().length).toBeGreaterThan(0);
+    // string[] 被合并为一个 block（用 \n\n 连接）
+    expect(a.blockCount).toBe(3);
+    expect(a.hasBaseIdentity).toBe(true);
+    expect(a.hasCustomMarker).toBe(true);
+    expect(a.hasFullClaudeCode).toBe(false);
 
-    prettyFormatJsonFiles(apiBodyDir);
+    prettyFormatJsonFiles(dir);
   }, 120000);
 
-  // Case 4: systemPrompt = { type: 'preset', preset: 'claude_code' }（使用默认）
-  it('case-4 preset默认: 使用Claude Code默认prompt', async () => {
-    const apiBodyDir = createTimestampDir('system-prompt/case-4-preset-default');
-    const result = await runQuery({
-      env: { ...BASE_ENV, OTEL_LOG_RAW_API_BODIES: `file:${apiBodyDir}` },
-      includePartialMessages: true,
-      persistSession: false,
-      settingSources: [],
-      effort: 'low',
-      tools: [],
+  it('case-4 preset claude_code: 完整Claude Code prompt(~26000 chars)', async () => {
+    const dir = createTimestampDir('system-prompt/case-4-preset-default');
+    await run({
+      env: { ...BASE_ENV, OTEL_LOG_RAW_API_BODIES: `file:${dir}` },
+      includePartialMessages: true, persistSession: false, settingSources: [], effort: 'low', tools: [],
       systemPrompt: { type: 'preset', preset: 'claude_code' },
     });
 
-    const analysis = analyzeSystemPrompt(apiBodyDir);
-    console.error('\n[case-4] systemBlockCount:', analysis.systemBlockCount);
-    console.error('[case-4] totalSystemChars:', analysis.totalSystemChars);
-    console.error('[case-4] containsClaudeCode:', analysis.containsClaudeCode);
-    console.error('[case-4] blocks preview:', analysis.systemBlocks.map(b => b.text.slice(0, 80)));
+    const a = analyze(dir);
+    console.error(`\n[case-4] ${a.blockCount} blocks, ${a.totalChars} chars`);
+    console.error(`[case-4] blocks: ${a.blocks.map(b => `${b.chars}c`).join(', ')}`);
 
-    // 应该包含完整的 Claude Code 默认 prompt（比 case-1 大得多）
-    expect(analysis.containsClaudeCode).toBe(true);
-    expect(analysis.totalSystemChars).toBeGreaterThan(1000);
-    expect(analysis.containsCustomText).toBe(false);
-    expect(result.trim().length).toBeGreaterThan(0);
+    // 完整 Claude Code prompt
+    expect(a.blockCount).toBe(3);
+    expect(a.hasBillingHeader).toBe(true);
+    expect(a.hasBaseIdentity).toBe(true);
+    expect(a.hasFullClaudeCode).toBe(true);
+    expect(a.totalChars).toBeGreaterThan(20000);
+    // 动态段（gitStatus）在 system prompt 中
+    expect(a.hasGitStatus).toBe(true);
 
-    prettyFormatJsonFiles(apiBodyDir);
+    prettyFormatJsonFiles(dir);
   }, 120000);
 
-  // Case 5: systemPrompt = { type: 'preset', preset: 'claude_code', append: '...' }
-  it('case-5 preset+append: 默认prompt后追加自定义内容', async () => {
-    const apiBodyDir = createTimestampDir('system-prompt/case-5-preset-append');
-    const result = await runQuery({
-      env: { ...BASE_ENV, OTEL_LOG_RAW_API_BODIES: `file:${apiBodyDir}` },
-      includePartialMessages: true,
-      persistSession: false,
-      settingSources: [],
-      effort: 'low',
-      tools: [],
-      systemPrompt: {
-        type: 'preset',
-        preset: 'claude_code',
-        append: 'JEREH_CUSTOM_MARKER: Always respond in Chinese.',
-      },
+  it('case-5 preset+append: 自定义内容插入在动态段之前', async () => {
+    const dir = createTimestampDir('system-prompt/case-5-preset-append');
+    await run({
+      env: { ...BASE_ENV, OTEL_LOG_RAW_API_BODIES: `file:${dir}` },
+      includePartialMessages: true, persistSession: false, settingSources: [], effort: 'low', tools: [],
+      systemPrompt: { type: 'preset', preset: 'claude_code', append: `${CUSTOM_MARKER}: Always respond in Chinese.` },
     });
 
-    const analysis = analyzeSystemPrompt(apiBodyDir);
-    console.error('\n[case-5] systemBlockCount:', analysis.systemBlockCount);
-    console.error('[case-5] totalSystemChars:', analysis.totalSystemChars);
-    console.error('[case-5] containsClaudeCode:', analysis.containsClaudeCode);
-    console.error('[case-5] containsCustomText:', analysis.containsCustomText);
-    console.error('[case-5] customTextPosition:', analysis.customTextPosition);
+    const a = analyze(dir);
+    console.error(`\n[case-5] ${a.blockCount} blocks, ${a.totalChars} chars`);
 
-    // 应该同时包含 Claude Code 默认 prompt 和自定义内容
-    expect(analysis.containsClaudeCode).toBe(true);
-    expect(analysis.containsCustomText).toBe(true);
-    expect(analysis.customTextPosition).toBe('appended');
-    expect(analysis.totalSystemChars).toBeGreaterThan(1000);
-    expect(result.trim().length).toBeGreaterThan(0);
+    expect(a.hasBillingHeader).toBe(true);
+    expect(a.hasFullClaudeCode).toBe(true);
+    expect(a.hasCustomMarker).toBe(true);
+    expect(a.hasGitStatus).toBe(true);
+    // append 内容和 Claude Code prompt 在同一个 block 中
+    expect(a.customMarkerBlockIdx).toBe(2);
+    // 总大小比 case-4 略大
+    expect(a.totalChars).toBeGreaterThan(25000);
 
-    prettyFormatJsonFiles(apiBodyDir);
+    // 验证 append 内容在 gitStatus 之前
+    const bigBlock = a.blocks[2].text;
+    const markerPos = bigBlock.indexOf(CUSTOM_MARKER);
+    const gitPos = bigBlock.indexOf('gitStatus');
+    expect(markerPos).toBeLessThan(gitPos);
+
+    prettyFormatJsonFiles(dir);
   }, 120000);
 
-  // Case 6: systemPrompt = { type: 'preset', preset: 'claude_code', excludeDynamicSections: true }
-  it('case-6 preset+excludeDynamic: 去除动态段，观察user message变化', async () => {
-    const apiBodyDir = createTimestampDir('system-prompt/case-6-preset-exclude-dynamic');
-    const result = await runQuery({
-      env: { ...BASE_ENV, OTEL_LOG_RAW_API_BODIES: `file:${apiBodyDir}` },
-      includePartialMessages: true,
-      persistSession: false,
-      settingSources: [],
-      effort: 'low',
-      tools: [],
-      systemPrompt: {
-        type: 'preset',
-        preset: 'claude_code',
-        excludeDynamicSections: true,
-      },
+  it('case-6 preset+excludeDynamic: 动态段移到user message', async () => {
+    const dir = createTimestampDir('system-prompt/case-6-preset-exclude-dynamic');
+    await run({
+      env: { ...BASE_ENV, OTEL_LOG_RAW_API_BODIES: `file:${dir}` },
+      includePartialMessages: true, persistSession: false, settingSources: [], effort: 'low', tools: [],
+      systemPrompt: { type: 'preset', preset: 'claude_code', excludeDynamicSections: true },
     });
 
-    const analysis = analyzeSystemPrompt(apiBodyDir);
-    console.error('\n[case-6] systemBlockCount:', analysis.systemBlockCount);
-    console.error('[case-6] totalSystemChars:', analysis.totalSystemChars);
-    console.error('[case-6] userMessageBlockCount:', analysis.userMessageBlockCount);
-    console.error('[case-6] userMessageText length:', analysis.userMessageText.length);
+    const a = analyze(dir);
+    console.error(`\n[case-6] system: ${a.blockCount} blocks, ${a.totalChars} chars`);
+    console.error(`[case-6] user: ${a.userBlocks} blocks, first=${a.userFirstBlockChars} chars`);
+    console.error(`[case-6] gitStatus in system: ${a.hasGitStatus}, in user: ${a.userHasGitStatus}`);
 
-    // 动态段被移到 user message 中
-    expect(analysis.containsClaudeCode).toBe(true);
-    expect(result.trim().length).toBeGreaterThan(0);
+    expect(a.hasFullClaudeCode).toBe(true);
+    // 动态段从 system 移到了 user message
+    expect(a.hasGitStatus).toBe(false);
+    expect(a.userHasGitStatus).toBe(true);
+    // system 比 case-4 小（少了动态段）
+    expect(a.totalChars).toBeLessThan(25500);
+    // user message 第一个 block 变大了（包含动态段）
+    expect(a.userFirstBlockChars).toBeGreaterThan(500);
 
-    prettyFormatJsonFiles(apiBodyDir);
+    prettyFormatJsonFiles(dir);
   }, 120000);
 
-  // Case 7: 对比 case-1 和 case-4 → 不设置 vs preset 的区别
-  it('case-7 对比: 不设置systemPrompt vs preset claude_code 的system长度差异', async () => {
-    // 先跑不设置的
-    const dir1 = createTimestampDir('system-prompt/case-7-compare-no-prompt');
-    await runQuery({
+  it('case-7 身份声明对比: 不设置 vs preset 的身份文本不同', async () => {
+    const dir1 = createTimestampDir('system-prompt/case-7-identity-no-prompt');
+    await run({
       env: { ...BASE_ENV, OTEL_LOG_RAW_API_BODIES: `file:${dir1}` },
-      includePartialMessages: true,
-      persistSession: false,
-      settingSources: [],
-      effort: 'low',
-      tools: [],
+      includePartialMessages: true, persistSession: false, settingSources: [], effort: 'low', tools: [],
     });
 
-    // 再跑 preset 的
-    const dir2 = createTimestampDir('system-prompt/case-7-compare-preset');
-    await runQuery({
+    const dir2 = createTimestampDir('system-prompt/case-7-identity-preset');
+    await run({
       env: { ...BASE_ENV, OTEL_LOG_RAW_API_BODIES: `file:${dir2}` },
-      includePartialMessages: true,
-      persistSession: false,
-      settingSources: [],
-      effort: 'low',
-      tools: [],
+      includePartialMessages: true, persistSession: false, settingSources: [], effort: 'low', tools: [],
       systemPrompt: { type: 'preset', preset: 'claude_code' },
     });
 
-    const a1 = analyzeSystemPrompt(dir1);
-    const a2 = analyzeSystemPrompt(dir2);
+    const a1 = analyze(dir1);
+    const a2 = analyze(dir2);
 
-    console.error('\n[case-7] 不设置: systemChars=', a1.totalSystemChars, 'blocks=', a1.systemBlockCount);
-    console.error('[case-7] preset:  systemChars=', a2.totalSystemChars, 'blocks=', a2.systemBlockCount);
-    console.error('[case-7] 差异倍数:', (a2.totalSystemChars / a1.totalSystemChars).toFixed(1), 'x');
+    console.error(`\n[case-7] 不设置 identity: "${a1.identityText}"`);
+    console.error(`[case-7] preset identity: "${a2.identityText.slice(0, 100)}..."`);
+    console.error(`[case-7] 大小对比: ${a1.totalChars} vs ${a2.totalChars} (${(a2.totalChars / a1.totalChars).toFixed(0)}x)`);
 
-    // preset 应该比不设置大很多（完整 Claude Code prompt vs 精简 SDK agent prompt）
-    expect(a2.totalSystemChars).toBeGreaterThan(a1.totalSystemChars);
+    // 不设置时身份是精简的
+    expect(a1.identityText).toContain('Claude agent');
+    expect(a1.identityText).toContain('Claude Agent SDK');
+    // preset 时身份 block 相同，但多了完整的行为指令 block
+    expect(a2.identityText).toContain('Claude agent');
+    expect(a2.hasFullClaudeCode).toBe(true);
+    // 大小差异巨大（178x）
+    expect(a2.totalChars).toBeGreaterThan(a1.totalChars * 100);
 
     prettyFormatJsonFiles(dir1);
     prettyFormatJsonFiles(dir2);
