@@ -1,30 +1,17 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import dotenv from 'dotenv';
-import { mkdirSync, readdirSync, readFileSync, existsSync } from 'fs';
+import { readdirSync, readFileSync, existsSync } from 'fs';
 import { join } from 'path';
+import { createTimestampDir, prettyFormatJsonFiles } from './helpers';
 
 dotenv.config();
-
-// 生成带时间戳的目录名，每次运行隔离
-function createTimestampDir(): string {
-  const now = new Date();
-  const ts = now.getFullYear().toString()
-    + String(now.getMonth() + 1).padStart(2, '0')
-    + String(now.getDate()).padStart(2, '0')
-    + '-' + String(now.getHours()).padStart(2, '0')
-    + String(now.getMinutes()).padStart(2, '0')
-    + String(now.getSeconds()).padStart(2, '0');
-  const dir = join(__dirname, 'tmp', 'local-llm', ts);
-  mkdirSync(dir, { recursive: true });
-  return dir;
-}
 
 describe('Local LLM - OTEL_LOG_RAW_API_BODIES 测试', () => {
   let apiBodyDir: string;
 
   beforeEach(() => {
-    apiBodyDir = createTimestampDir();
+    apiBodyDir = createTimestampDir('local-llm');
   });
 
   it('应该能通过 OTEL_LOG_RAW_API_BODIES 捕获首次请求', async () => {
@@ -95,13 +82,13 @@ describe('Local LLM - OTEL_LOG_RAW_API_BODIES 测试', () => {
 
       console.error(`\n✅ 成功捕获 API 请求!`);
       console.error(`📋 请求 keys: ${Object.keys(requestBody).join(', ')}`);
-      console.error(`� model: ${requestBody.model}`);
+      console.error(`📋 model: ${requestBody.model}`);
       console.error(`📋 system prompt 类型: ${typeof requestBody.system}`);
       console.error(`📋 system prompt 长度: ${JSON.stringify(requestBody.system)?.length}`);
       console.error(`📋 messages 数量: ${requestBody.messages?.length}`);
       console.error(`📋 tools 数量: ${requestBody.tools?.length}`);
 
-      // system prompt 前 1000 字符
+      // system prompt 前 100 字符
       const systemStr = JSON.stringify(requestBody.system, null, 2);
       console.error(`\n📋 System Prompt (前100字符):\n${systemStr.slice(0, 100)}`);
 
@@ -137,5 +124,8 @@ describe('Local LLM - OTEL_LOG_RAW_API_BODIES 测试', () => {
     }
 
     expect(resultText.trim().length).toBeGreaterThan(0);
+
+    // 对目录下所有 JSON 文件进行 pretty 格式化
+    prettyFormatJsonFiles(apiBodyDir);
   }, 120000);
 });

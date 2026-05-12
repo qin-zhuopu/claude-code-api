@@ -1,30 +1,17 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import dotenv from 'dotenv';
-import { mkdirSync, readdirSync, readFileSync, existsSync } from 'fs';
+import { readdirSync, readFileSync, existsSync } from 'fs';
 import { join } from 'path';
-import { execSync } from 'child_process';
+import { createTimestampDir, prettyFormatJsonFiles } from './helpers';
 
 dotenv.config();
-
-function createTimestampDir(): string {
-  const now = new Date();
-  const ts = now.getFullYear().toString()
-    + String(now.getMonth() + 1).padStart(2, '0')
-    + String(now.getDate()).padStart(2, '0')
-    + '-' + String(now.getHours()).padStart(2, '0')
-    + String(now.getMinutes()).padStart(2, '0')
-    + String(now.getSeconds()).padStart(2, '0');
-  const dir = join(__dirname, 'tmp', 'tools-disabled', ts);
-  mkdirSync(dir, { recursive: true });
-  return dir;
-}
 
 describe('Local LLM - tools disabled', () => {
   let apiBodyDir: string;
 
   beforeEach(() => {
-    apiBodyDir = createTimestampDir();
+    apiBodyDir = createTimestampDir('tools-disabled');
   });
 
   it('tools 应该为空当 options.tools 为空数组', async () => {
@@ -88,11 +75,6 @@ describe('Local LLM - tools disabled', () => {
     expect(resultText.trim().length).toBeGreaterThan(0);
 
     // 对目录下所有 JSON 文件进行 pretty 格式化
-    const jsonFiles = readdirSync(apiBodyDir).filter(f => f.endsWith('.json') && !f.endsWith('.pretty.json'));
-    const scriptPath = join(__dirname, '..', '..', 'scripts', 'pretty-json-keys.js');
-    for (const file of jsonFiles) {
-      const filePath = join(apiBodyDir, file);
-      execSync(`node "${scriptPath}" "${filePath}"`, { stdio: 'inherit' });
-    }
+    prettyFormatJsonFiles(apiBodyDir);
   }, 120000);
 });
