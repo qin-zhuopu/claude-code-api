@@ -1,4 +1,4 @@
-import { IsOptional, IsString, IsNotEmpty } from 'class-validator';
+import { IsOptional, IsString, IsBoolean, IsNotEmpty } from 'class-validator';
 
 export class QueryOptionsDto {
   @IsOptional()
@@ -8,6 +8,10 @@ export class QueryOptionsDto {
   @IsOptional()
   @IsString()
   model?: string;
+
+  @IsOptional()
+  @IsBoolean()
+  includePartialMessages?: boolean;
 }
 
 export class QueryRequestDto {

@@ -21,6 +21,7 @@ export class QueryService {
         options: {
           ...options,
           abortController,
+          includePartialMessages: options?.includePartialMessages ?? false,
         },
       });
 
@@ -88,33 +89,23 @@ export class QueryService {
    * 将 SDK 消息转换为 SSE 事件
    */
   private messageToEvent(message: any): QueryEventData {
-    // SDKMessage 结构比较复杂，这里简化处理
-    if (message.type === 'text') {
-      return {
-        type: 'text',
-        content: message.content?.[0]?.text || '',
-      };
+    // 优先检测 stream_event（includePartialMessages 开启时的流式消息）
+    // SDK yield 的 message 可能是序列化后的字符串，需要判断
+    if (typeof message === 'string') {
+      try {
+        const parsed = JSON.parse(message);
+        if (parsed.type === 'stream_event') {
+          return { type: 'partial', content: message };
+        }
+      } catch {}
+      return { type: 'text', content: message };
     }
 
-    if (message.type === 'tool_use') {
-      return {
-        type: 'tool_use',
-        toolName: message.name,
-        toolInput: message.input,
-      };
+    if (message.type === 'stream_event') {
+      return { type: 'partial', content: JSON.stringify(message) };
     }
 
-    if (message.type === 'tool_result') {
-      return {
-        type: 'tool_result',
-        content: JSON.stringify(message.content),
-      };
-    }
-
-    return {
-      type: 'text',
-      content: JSON.stringify(message),
-    };
+    return { type: 'text', content: JSON.stringify(message) };
   }
 
   /**

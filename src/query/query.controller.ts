@@ -18,6 +18,8 @@ export class QueryController {
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('X-Accel-Buffering', 'no');
+    res.setHeader('Transfer-Encoding', 'chunked');
+    res.flushHeaders();
 
     // 执行查询
     const stream$ = this.queryService.execute(dto.prompt, dto.options);
@@ -25,7 +27,10 @@ export class QueryController {
     // 订阅流并发送 SSE 事件
     const subscription = stream$.subscribe({
       next: (event) => {
-        res.write(`data: ${JSON.stringify(event)}\n\n`);
+        const ts = Date.now();
+        res.write(`data: ${JSON.stringify({ ...event, ts })}\n\n`);
+        const flushable = res as any;
+        if (typeof flushable.flush === 'function') flushable.flush();
       },
       error: (error) => {
         console.error('Query error:', error);

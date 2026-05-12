@@ -1,5 +1,5 @@
 export interface QueryEventData {
-  type: 'text' | 'tool_use' | 'tool_result' | 'error' | 'done';
+  type: 'text' | 'partial' | 'tool_use' | 'tool_result' | 'error' | 'done';
   content?: string;
   toolName?: string;
   toolInput?: Record<string, unknown>;
