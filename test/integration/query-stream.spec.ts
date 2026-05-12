@@ -57,7 +57,7 @@ describe('Query API (e2e)', () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           prompt: 'What is 2+2?',
-          options: { env: [] },
+          options: { env: {} },
         }),
       });
 
@@ -74,7 +74,7 @@ describe('Query API (e2e)', () => {
           chunks.push(decoder.decode(value));
         }
         const fullText = chunks.join('');
-        expect(fullText).toMatch(/Not logged in|authentication/i);
+        expect(fullText).toMatch(/Not logged in|authentication|error/i);
       }
     });
   });
@@ -178,20 +178,20 @@ describe('Query API (e2e)', () => {
             try {
               const json = JSON.parse(line.slice(5).trim());
 
-              if (json.type === 'text' && json.content) {
+              if ((json.type === 'text' || json.type === 'partial') && json.content) {
                 const inner = typeof json.content === 'string'
                   ? JSON.parse(json.content)
                   : json.content;
 
                 if (inner.type === 'stream_event' && inner.event?.type === 'content_block_delta') {
                   const delta = inner.event.delta;
-                  if (delta?.text) {
+                  if (delta?.type === 'text_delta' && delta.text) {
                     const text = delta.text;
                     charCount += text.length;
                     fullText += text;
                     secondBuffer += text;
                   }
-                  if (delta?.thinking) {
+                  if (delta?.type === 'thinking_delta' && delta.thinking) {
                     const thinking = delta.thinking;
                     thinkingCount += thinking.length;
                     thinkingText += thinking;

@@ -1,7 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { query, Options, Query } from '@anthropic-ai/claude-agent-sdk';
 import { Observable } from 'rxjs';
-import { QueryEventData } from './dto';
+import { QueryEventData, QueryOptionsDto } from './dto';
 
 @Injectable()
 export class QueryService {
@@ -10,7 +10,7 @@ export class QueryService {
   /**
    * 执行查询并返回 SSE 流
    */
-  execute(prompt: string, options?: Options): Observable<QueryEventData> {
+  execute(prompt: string, options?: QueryOptionsDto): Observable<QueryEventData> {
     const sessionId = this.generateSessionId();
     const abortController = new AbortController();
 
@@ -22,7 +22,7 @@ export class QueryService {
           ...options,
           abortController,
           includePartialMessages: options?.includePartialMessages ?? false,
-        },
+        } as Options,
       });
 
       // 保存活跃查询

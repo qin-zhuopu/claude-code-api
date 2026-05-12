@@ -12,7 +12,7 @@
     "test": "vitest --run",
     "test:integration": "vitest --config ./test/integration/vitest.config.ts --run",
     "test:integration:watch": "vitest --config ./test/integration/vitest.config.ts",
-    "test:integration:list": "node -e \"console.log('\\n📋 集成测试:\\n  npm run test:integration -- events                 - SSE 流式输出测试\\n  npm run test:integration -- query-stream           - LLM 流式输出测试\\n  npm run test:integration -- stream-authenticity    - SSE 流式输出真伪断言测试\\n\\n常用参数: --reporter=verbose | --reporter=dot\\n')\"",
+    "test:integration:list": "node -e \"console.log('\\n📋 集成测试:\\n  npm run test:integration -- events                 - SSE 流式输出测试\\n  npm run test:integration -- query-stream           - LLM 流式输出测试\\n  npm run test:integration -- stream-authenticity    - SSE 流式输出真伪断言测试\\n  npm run test:integration -- conversation-memory    - 会话上下文记忆测试\\n\\n常用参数: --reporter=verbose | --reporter=dot\\n')\"",
     "demo": "echo '\\n📋 Available demos:\\n  npm run demo:simple-query       - Simple query demo\\n  npm run demo:memory            - Conversation memory demo\\n  npm run demo:stream           - 实时流式输出 (需先启动服务器)\\n  npm run demo:claude-code-intro - Claude Code introduction (1000+ words, no tools)\\n\\n💡 提示: 运行 demo:stream 前，先执行: npm run start:dev'",
     "demo:simple-query": "vitest --config ./test/demos/vitest.simple-query.config.ts --run",
     "demo:memory": "vitest --config ./test/demos/vitest.memory.config.ts --run",
