@@ -32,10 +32,13 @@ coverage/
 # Temporary files
 *.tmp
 .claude-trace/
+test/integration/tmp/
+raw/claude-code-docs/
 
 # Claude Code
 .agents/
 .claude/skills/
+.claude/api-bodies/
 skills-lock.json
 
 
