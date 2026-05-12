@@ -8,10 +8,10 @@ dotenv.config();
 
 const queryOptions = {
   env: {
-    ANTHROPIC_AUTH_TOKEN: process.env.ANTHROPIC_AUTH_TOKEN,
-    ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL,
-    API_TIMEOUT_MS: process.env.API_TIMEOUT_MS,
-    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC,
+    ANTHROPIC_AUTH_TOKEN: process.env.ANTHROPIC_AUTH_TOKEN_BIGMODEL,
+    ANTHROPIC_BASE_URL: 'https://open.bigmodel.cn/api/anthropic',
+    API_TIMEOUT_MS: '3000000',
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
   },
   agent: 'simple',
   agents: {

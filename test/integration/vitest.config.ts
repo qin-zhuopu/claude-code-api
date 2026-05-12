@@ -9,6 +9,5 @@ export default defineConfig({
     globals: true,
     bail: 1,
     fileParallelism: false,
-    singleThread: true,
   },
 });
