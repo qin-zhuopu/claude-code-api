@@ -200,6 +200,10 @@ Claude Code **只认** `.claude/skills/` 路径：
 
 ### 封装 Agent 的推荐模式
 
+#### 方案 A：用 CLAUDE_CONFIG_DIR 完全隔离 + skills 过滤
+
+skill 通过 Skill 工具按需加载，模型调用时才注入全文。
+
 ```typescript
 // 方案 A：用 CLAUDE_CONFIG_DIR 完全隔离（推荐）
 query({
@@ -218,7 +222,11 @@ query({
     persistSession: false,
   },
 });
+```
 
+#### 方案 B：用 additionalDirectories 注入
+
+```typescript
 // 方案 B：用 additionalDirectories 注入
 query({
   prompt: userInput,
@@ -233,7 +241,117 @@ query({
 });
 ```
 
-**注意执行顺序**：`CLAUDE_CONFIG_DIR`（决定用户级路径）→ `settingSources`（控制发现）→ `skills`（控制过滤）→ `tools`（控制工具可用性）。四者是串联关系，任何一环断开都会导致 skill 不可用。
+#### 方案 C：用 agent 定义精确控制工具和技能（最完整）
+
+通过 `agent` + `agents` 定义一个完整的 agent，同时控制工具白名单和 skill 预加载。
+
+```typescript
+query({
+  prompt: userInput,
+  options: {
+    cwd: userWorkDir,
+    env: {
+      ...process.env,
+      CLAUDE_CONFIG_DIR: '/your-agent/config',
+    },
+
+    // 指定使用哪个 agent
+    agent: 'my-assistant',
+
+    // 定义 agent
+    agents: {
+      'my-assistant': {
+        description: 'A focused assistant with specific capabilities',
+        prompt: 'You are a helpful assistant. Follow skill instructions.',
+
+        // 精确控制工具白名单
+        tools: ['Skill', 'Read', 'Grep', 'Glob'],
+
+        // 预加载 skill 全文到 agent 的 system prompt
+        skills: ['greet', 'joke'],
+
+        // 可选配置
+        model: 'sonnet',
+        effort: 'low',
+      },
+    },
+
+    // 全局 skill 发现控制
+    settingSources: ['user'],
+    skills: ['greet', 'joke'],      // 全局过滤（双重保险）
+    persistSession: false,
+  },
+});
+```
+
+### `options` 层 vs `agents[x]` 层的区别
+
+| 维度 | `options.tools` / `options.skills` | `agents[x].tools` / `agents[x].skills` |
+|------|------|------|
+| 作用域 | 全局（整个会话） | 仅该 agent |
+| tools 语义 | 可用工具的基础集 | agent 可用的工具白名单 |
+| skills 语义 | 过滤可见 skill 列表 | **预加载** skill 全文到 agent 的 system prompt |
+| 加载时机 | 模型调用 Skill 工具时才加载全文 | agent 启动时就注入全文 |
+
+### Skill 预加载 vs 按需加载
+
+| 模式 | 配置 | 行为 |
+|------|------|------|
+| 按需加载 | `options.skills: ['greet']` + `tools: ['Skill']` | skill 名称和描述在列表中可见，模型调用 Skill 工具时才加载全文 |
+| 预加载 | `agents[x].skills: ['greet']` | skill 全文在 agent 启动时就注入 system prompt，无需调用 Skill 工具 |
+| 预加载 + 无 Skill 工具 | `agents[x].skills: ['greet']` + `agents[x].tools: ['Read', 'Bash']` | skill 内容已在上下文中，agent 直接按指令执行，且无法调用其他 skill |
+
+**最严格的控制方式**：预加载 + 不给 Skill 工具。agent 看到了 skill 的指令内容，但没有 Skill 工具去调用其他 skill：
+
+```typescript
+agents: {
+  'strict-greeter': {
+    description: 'Only greets, nothing else',
+    prompt: 'Follow the skill instructions below exactly.',
+    tools: ['Read'],              // 不给 Skill 工具
+    skills: ['greet'],            // 但 greet 的 SKILL.md 全文已注入 prompt
+  },
+},
+```
+
+**注意执行顺序**：`CLAUDE_CONFIG_DIR`（决定用户级路径）→ `settingSources`（控制发现）→ `options.skills`（全局过滤）→ `options.tools`（工具可用性）→ `agents[x].tools`（agent 工具白名单）→ `agents[x].skills`（预加载到 prompt）。
+
+完整管道图：
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ 第一步：发现（加法，做并集）                                       │
+│                                                                 │
+│  CLAUDE_CONFIG_DIR/skills/  ──┐                                 │
+│  ~/.claude/skills/           ──┼── settingSources: ['user']     │
+│                               │                                 │
+│  cwd/.claude/skills/         ──┼── settingSources: ['project']  │
+│  additionalDirectories       ──┘                                │
+│                                                                 │
+│  bundled skills ──────────────── 始终存在                        │
+│                                                                 │
+│                         ↓ 汇总成 skill 池子                      │
+├─────────────────────────────────────────────────────────────────┤
+│ 第二步：过滤（减法）                                              │
+│                                                                 │
+│  options.skills: ['greet', 'joke']  → 只保留指定的               │
+│                                                                 │
+│                         ↓ 过滤后的 skill 列表                    │
+├─────────────────────────────────────────────────────────────────┤
+│ 第三步：工具开关                                                  │
+│                                                                 │
+│  options.tools 包含 'Skill'  → 注入 Skill 工具 + skill 列表      │
+│  options.tools: []           → 整个 Skill 机制关闭               │
+│                                                                 │
+│                         ↓                                       │
+├─────────────────────────────────────────────────────────────────┤
+│ 第四步：Agent 层（可选）                                          │
+│                                                                 │
+│  agents[x].tools: [...]      → agent 可用工具白名单              │
+│  agents[x].skills: [...]     → 预加载 skill 全文到 system prompt │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
 
 ## 测试文件
 
