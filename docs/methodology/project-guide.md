@@ -274,6 +274,7 @@ Select-String -Path "test\integration\tmp\**\*.request.json" -Pattern "greet|jok
 | `stream-tool-grep.spec.ts` | `stream-tool-grep-behavior.md` |
 | `stream-tool-listmcpresources.spec.ts` | `stream-tool-listmcpresources-behavior.md` |
 | `stream-tool-lsp.spec.ts` | `stream-tool-lsp-behavior.md` |
+| `stream-tool-monitor.spec.ts` | `stream-tool-monitor-behavior.md` |
 | `skill-injection-matrix.spec.ts` | `custom-skill-injection.md` *(早期文件)* |
 | `system-prompt-matrix.spec.ts` | `system-prompt-options.md` *(早期文件)* |
 
@@ -317,6 +318,7 @@ Select-String -Path "test\integration\tmp\**\*.request.json" -Pattern "greet|jok
 | `raw/stream-tool-grep-behavior.md` | Grep 流式工具调用（瞬时工具、input={pattern}+12 可选参数、5-7 次 input_json_delta、tool_result 含 {mode,filenames,numFiles,content?,numLines?} 结构化对象、三种 output_mode 差异、零 tool_progress、Vue3+Element Plus 搜索结果/代码行渲染方案） |
 | `raw/stream-tool-listmcpresources-behavior.md` | ListMcpResourcesTool 流式工具调用（需 MCP 服务器前置条件、input={server?} 可选参数、3-4 次 input_json_delta、tool_result 返回 {uri,name,mimeType?,description?,server}[] 资源数组、零 tool_progress、瞬时工具、Vue3+Element Plus 资源表格渲染方案） |
 | `raw/stream-tool-lsp-behavior.md` | LSP 流式工具调用（条件性可用工具、需 LSP plugin + language server binary 前置条件、input_schema 推断含 action+file_path+line+character、LSP 不可用时 Claude 自动回退到 Grep+Read 组合、零 tool_progress（推断）、Edit 后自动推送诊断、Vue3+Element Plus 代码智能卡片渲染方案） |
+| `raw/stream-tool-monitor-behavior.md` | Monitor 流式工具调用（条件性可用工具、需 Anthropic 直连端点 + 遥测启用 + v2.1.98+、SDK 无 MonitorInput/MonitorOutput 类型定义、input={command,description,timeout_ms?,persistent?}、非 Anthropic 端点时 LLM 三级回退策略（Bash→Skill→文本）、逐行输出推送机制（推断）、Vue3+Element Plus 实时监控终端渲染方案） |
 
 > 每次新增实验文档后，更新本节索引。
 
@@ -344,6 +346,7 @@ Select-String -Path "test\integration\tmp\**\*.request.json" -Pattern "greet|jok
 | `stream-tool-grep.spec.ts` | Grep 工具流式事件观察（6 cases），含 files_with_matches/content 两种 output_mode 的 tool_result 格式对比、input={pattern}+可选参数、5-7 次 input_json_delta、零 tool_progress、SSE 前端视角 |
 | `stream-tool-listmcpresources.spec.ts` | ListMcpResourcesTool 流式事件观察（6 cases），含 MCP 服务器配置、无参数/带参数两种 input 对比、无 MCP 服务器时工具不可用、SSE 前端视角、关闭流式对比 |
 | `stream-tool-lsp.spec.ts` | LSP 工具流式事件观察（6 cases），含 LSP 条件性可用机制（需要 plugin + binary）、LSP 不可用时 Claude 自动回退到 Grep+Read、input_schema 推断、tool_result 格式推断、SSE 前端视角 |
+| `stream-tool-monitor.spec.ts` | Monitor 工具流式事件观察（6 cases），含条件性可用机制（需 Anthropic 端点 + 遥测）、工具不可用时 LLM 三级回退策略分析、input_schema 文档推断、tool_result 格式推断、SSE 前端视角 |
 
 ## 执行命令
 
