@@ -78,6 +78,43 @@ createTimestampDir(subDir: string): string
 prettyFormatJsonFiles(dir: string): void
 ```
 
+### runQuery 封装
+
+每个测试文件都需要消费 SDK 的 async iterator。建议将通用的 `runQuery` 逻辑提取到 helpers 或测试文件顶部：
+
+```typescript
+async function runQuery(options: {
+  env: Record<string, string | undefined>;
+  prompt: string;
+  tools?: any[];
+  cwd?: string;
+}): Promise<string> {
+  const sdkQuery = query({
+    prompt: options.prompt,
+    options: {
+      env: options.env,
+      cwd: options.cwd,
+      includePartialMessages: true,
+      persistSession: false,
+      settingSources: [],
+      effort: 'low',
+      ...(options.tools !== undefined ? { tools: options.tools } : {}),
+    } as any,
+  });
+
+  let resultText = '';
+  for await (const message of sdkQuery) {
+    const msg = message as any;
+    if (msg.type === 'stream_event' && msg.event?.type === 'content_block_delta') {
+      const delta = msg.event.delta;
+      if (delta?.type === 'text_delta') process.stderr.write(delta.text);
+    }
+    if (msg.type === 'result') resultText = msg.result || '';
+  }
+  return resultText;
+}
+```
+
 ### 测试用例模板
 
 ```typescript
@@ -123,6 +160,8 @@ describe('XXX 矩阵', () => {
 3. **分析函数**：从 JSON 文件中提取结构化指标
 4. **先 console.error 再 expect**：方便调试时看到实际值
 5. **prettyFormatJsonFiles**：格式化 JSON 便于人工检查
+6. **分析函数容错**：对 `JSON.parse` 做 try-catch，SDK 可能产出截断的 response 文件（流式中断、超时等）
+7. **控制变量对比**：验证某个变量的效果时，设计「基线 case」和「变量 case」，保持其他参数完全一致。对比维度：文件数量、文件大小、特定字段的有无。文件大小相同 = 变量无效
 
 ## 日志观察方法
 
@@ -170,6 +209,7 @@ Select-String -Path "test\integration\tmp\**\*.request.json" -Pattern "greet|jok
 2. 处理意外发现（如 "string 不替换默认 prompt"）
 3. 补充遗漏的用例（如 "string[] 的行为是否与 string 相同？"）
 4. 确认交互效应
+5. **避免精确字节数断言**：动态内容（时间戳、UUID、session 信息）导致每次运行有微小差异，用量级断言（`toBeGreaterThan`）或结构断言代替
 
 ### 第三轮：文档化
 
@@ -177,6 +217,50 @@ Select-String -Path "test\integration\tmp\**\*.request.json" -Pattern "greet|jok
 2. 写各参数独立作用
 3. 标注关键发现
 4. 给出实际应用建议
+
+### 否定实验模式
+
+当对比组之间无差异时，这本身就是重要发现。处理方式：
+
+1. 明确声明「变量 X 在场景 Y 下无效」
+2. 推断其实际作用域（如：仅影响 OTLP 导出，不影响 file: dump）
+3. 在文档中给出「何时该用 / 何时不用」的建议
+4. 用精确数据支撑结论（如：10 个 case 的 request size 完全一致 = 变量对文件内容无影响）
+
+## 文件命名规范
+
+### 原则
+
+采用 `{主题}-{子主题}` 的扁平命名，不建目录层级。
+
+- 扁平结构：文件数量可控（<30），前缀排序天然聚合同主题，vitest glob 更简单
+- 测试和文档成对：每个 `.spec.ts` 对应一个 `-behavior.md`
+
+### 命名规则
+
+```
+测试文件: test/integration/{主题}-{子主题}.spec.ts
+洞察文档: raw/{主题}-{子主题}-behavior.md
+设计文档: raw/{主题}-{子主题}-design.md
+```
+
+**主题**：描述被观察对象的类别，自由命名，kebab-case。例如当前已有的主题：`tool`、`query`、`otel`、`stream`、`conn`、`session`。新主题直接用，无需预注册。
+
+**子主题**：描述具体观察对象，kebab-case。如果对应 SDK 中的标识符，保持一致（`AskUserQuestion` → `ask-user-question`）。
+
+**深度限制**：最多两级（`{主题}-{子主题}`）。如果子主题内部还需细分，拆成独立文件而非加第三级。
+
+### 当前文件映射
+
+| 测试文件 | 洞察文档 |
+|----------|----------|
+| `tool-agent.spec.ts` | `tool-agent-behavior.md` |
+| `tool-ask-user-question.spec.ts` | `tool-ask-user-question-behavior.md` |
+| `otel-log-options.spec.ts` | `otel-log-options-behavior.md` |
+| `skill-injection-matrix.spec.ts` | `custom-skill-injection.md` *(早期文件)* |
+| `system-prompt-matrix.spec.ts` | `system-prompt-options.md` *(早期文件)* |
+
+> 早期文件保持原名，下次修改时顺手改为新规范。
 
 ## 文档输出位置
 
@@ -196,6 +280,11 @@ Select-String -Path "test\integration\tmp\**\*.request.json" -Pattern "greet|jok
 | `raw/system-prompt-options.md` | systemPrompt 的 7 组实验数据 |
 | `raw/skill-tool-prompt-structure.md` | Skill 工具对请求结构的影响 |
 | `raw/agent-packaging-design.md` | Agent 封装与分发方案设计 |
+| `raw/otel-log-options-behavior.md` | OTEL 日志选项的 10 组对比实验 |
+| `raw/tool-agent-behavior.md` | Agent 工具行为的观察性实验 |
+| `raw/tool-ask-user-question-behavior.md` | AskUserQuestion 工具行为的双环境交叉对比实验 |
+
+> 每次新增实验文档后，更新本节索引。
 
 ## 参考已有测试用例
 
@@ -205,6 +294,9 @@ Select-String -Path "test\integration\tmp\**\*.request.json" -Pattern "greet|jok
 | `system-prompt-matrix.spec.ts` | systemPrompt 专项，展示如何分析 system 字段结构 |
 | `tools-disabled.spec.ts` | 最简单的单一断言测试 |
 | `additional-directories.spec.ts` | 展示如何用 fixture 目录做隔离测试 |
+| `otel-log-options.spec.ts` | 控制变量对比 + 否定实验 + 多轮对话（工具调用）场景 |
+| `tool-agent.spec.ts` | Agent 工具测试（5 cases），含 agents 配置和 agent 会话模式 |
+| `tool-ask-user-question.spec.ts` | AskUserQuestion 工具测试，含双环境交叉对比、canUseTool 回调 |
 
 ## 执行命令
 
@@ -229,3 +321,5 @@ npx vitest run test/integration/ -t "case-"
 3. **CLAUDE_CONFIG_DIR**：用于隔离用户级配置，但会影响 credentials
 4. **日志目录**：`test/integration/tmp/` 应加入 `.gitignore`
 5. **并行执行**：vitest 默认并行跑文件，同一文件内串行。矩阵测试建议放同一文件
+6. **多轮对话场景**：使用会触发工具调用的 prompt（如 `Read the file ./package.json`），SDK 会自动执行工具并发起第二轮请求。`tmp/` 目录会产出多对 request/response 文件，分析函数需遍历所有 request 文件来检查 tool_result 消息
+7. **Response 文件可能截断**：流式中断或超时时，response JSON 可能不完整。分析函数中 `JSON.parse` 必须 try-catch
