@@ -270,6 +270,7 @@ Select-String -Path "test\integration\tmp\**\*.request.json" -Pattern "greet|jok
 | `stream-tool-edit.spec.ts` | `stream-tool-edit-behavior.md` |
 | `stream-tool-enterworktree.spec.ts` | `stream-tool-enterworktree-behavior.md` |
 | `stream-tool-exitworktree.spec.ts` | `stream-tool-exitworktree-behavior.md` |
+| `stream-tool-glob.spec.ts` | `stream-tool-glob-behavior.md` |
 | `skill-injection-matrix.spec.ts` | `custom-skill-injection.md` *(早期文件)* |
 | `system-prompt-matrix.spec.ts` | `system-prompt-options.md` *(早期文件)* |
 
@@ -309,6 +310,7 @@ Select-String -Path "test\integration\tmp\**\*.request.json" -Pattern "greet|jok
 | `raw/stream-tool-edit-behavior.md` | Edit 流式工具调用（read-before-edit 导致 3 轮 API 调用、成功 tool_result 含 structuredPatch unified diff、失败 tool_result 为错误字符串、6 次 input_json_delta、零 tool_progress、Vue3+Element Plus Diff 视图渲染方案） |
 | `raw/stream-tool-enterworktree-behavior.md` | EnterWorktree 流式工具调用（瞬时工具、成功 tool_result 含 {worktreePath, worktreeBranch, message} 结构化对象、失败 tool_result 为错误字符串、4 次 input_json_delta、零 tool_progress、Vue3+Element Plus worktree 卡片渲染方案） |
 | `raw/stream-tool-exitworktree-behavior.md` | ExitWorktree 流式工具调用（瞬时工具、成功 tool_result 含 {action, originalCwd, worktreePath, worktreeBranch?, discardedFiles?, discardedCommits?, message} 结构化对象、失败 tool_result 为错误字符串、4-5 次 input_json_delta、零 tool_progress、remove 模式需 discard_changes 重试、Vue3+Element Plus 退出 worktree 卡片渲染方案） |
+| `raw/stream-tool-glob-behavior.md` | Glob 流式工具调用（瞬时工具、input={pattern:string} 单参数、固定 4 次 input_json_delta、tool_result 含 {filenames:string[],durationMs,numFiles,truncated} 结构化对象、零 tool_progress、截断上限 100 文件、Vue3+Element Plus 文件列表表格渲染方案） |
 
 > 每次新增实验文档后，更新本节索引。
 
@@ -332,6 +334,7 @@ Select-String -Path "test\integration\tmp\**\*.request.json" -Pattern "greet|jok
 | `stream-tool-edit.spec.ts` | Edit 工具流式事件观察（5 cases），含 read-before-edit 三轮交互、成功 tool_result 结构化 structuredPatch diff、失败 tool_result 错误字符串、input_json_delta 6 次推送、SSE 前端视角 |
 | `stream-tool-enterworktree.spec.ts` | EnterWorktree 工具流式事件观察（6 cases），含成功/失败/非 git 三种 tool_result 格式对比、input_json_delta 4 次推送、零 tool_progress、SSE 前端视角 |
 | `stream-tool-exitworktree.spec.ts` | ExitWorktree 工具流式事件观察（6 cases），含 keep/remove 两种 action 对比、remove 重试（discard_changes）场景、不在 worktree 中调用的 no-op 错误、先创建再退出的多轮交互、SSE 前端视角 |
+| `stream-tool-glob.spec.ts` | Glob 工具流式事件观察（6 cases），含有结果/无结果/截断三种 tool_result 格式对比、input={pattern} 单参数、固定 4 次 input_json_delta、零 tool_progress、SSE 前端视角 |
 
 ## 执行命令
 
