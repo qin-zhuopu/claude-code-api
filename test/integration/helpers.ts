@@ -73,6 +73,10 @@ function printTree(value: unknown, prefix = ''): void {
 /**
  * 对单个 JSON 文件进行 pretty 格式化，生成 .pretty.json 文件并打印 key 信息
  */
+/**
+ * 对单个 JSON 文件进行 pretty 格式化，生成 .pretty.json 文件并打印 key 信息。
+ * 跳过空文件和无法解析的文件。
+ */
 export function prettyFormatJsonFile(filePath: string): void {
   const absolutePath = resolve(filePath);
   const dir = dirname(absolutePath);
@@ -81,7 +85,18 @@ export function prettyFormatJsonFile(filePath: string): void {
   const outPath = join(dir, `${name}.pretty.json`);
 
   const raw = readFileSync(absolutePath, 'utf-8');
-  const obj = JSON.parse(raw);
+  if (raw.length === 0) {
+    console.log(`Skipped (empty): ${absolutePath}`);
+    return;
+  }
+
+  let obj: unknown;
+  try {
+    obj = JSON.parse(raw);
+  } catch {
+    console.log(`Skipped (invalid JSON, ${raw.length} bytes): ${absolutePath}`);
+    return;
+  }
 
   // 写入格式化后的 JSON
   writeFileSync(outPath, JSON.stringify(obj, null, 2), 'utf-8');

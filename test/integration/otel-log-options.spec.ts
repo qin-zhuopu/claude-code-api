@@ -148,15 +148,19 @@ function analyzeLogDir(dir: string): LogAnalysis {
   if (responseFiles.length > 0) {
     const firstRespContent = readFileSync(join(dir, responseFiles[0]), 'utf-8');
     analysis.responseSize = firstRespContent.length;
-    const respBody = JSON.parse(firstRespContent);
+    try {
+      const respBody = JSON.parse(firstRespContent);
 
-    // 检查 response 中是否有 tool_use
-    if (Array.isArray(respBody.content)) {
-      const toolUseBlocks = respBody.content.filter((b: any) => b.type === 'tool_use');
-      analysis.hasToolUseInResponse = toolUseBlocks.length > 0;
-      if (analysis.hasToolUseInResponse) {
-        analysis.hasToolUseInput = toolUseBlocks.some((b: any) => b.input && Object.keys(b.input).length > 0);
+      // 检查 response 中是否有 tool_use
+      if (Array.isArray(respBody.content)) {
+        const toolUseBlocks = respBody.content.filter((b: any) => b.type === 'tool_use');
+        analysis.hasToolUseInResponse = toolUseBlocks.length > 0;
+        if (analysis.hasToolUseInResponse) {
+          analysis.hasToolUseInput = toolUseBlocks.some((b: any) => b.input && Object.keys(b.input).length > 0);
+        }
       }
+    } catch {
+      console.error(`[analyzeLogDir] Failed to parse response: ${responseFiles[0]} (${firstRespContent.length} bytes)`);
     }
   }
 
@@ -234,7 +238,8 @@ describe('OTEL 日志选项矩阵', () => {
 
   /**
    * Case 2: OTEL_LOG_USER_PROMPTS=false — 禁用用户 prompt 记录
-   * 预期：request 中 messages 的用户文本被脱敏或移除
+   * 实验结论：在 file: 模式下，此变量不影响文件内容。用户 prompt 仍然完整记录。
+   * 此变量仅影响 OTLP span 导出时是否包含用户 prompt 属性。
    */
   it('case-2 OTEL_LOG_USER_PROMPTS=false', async () => {
     const dir = createTimestampDir('otel-log-options/case-2-no-user-prompts');
@@ -250,11 +255,11 @@ describe('OTEL 日志选项矩阵', () => {
     const analysis = analyzeLogDir(dir);
     console.error('\n[case-2 no-user-prompts]', JSON.stringify(analysis, null, 2));
 
-    // 文件应该产出
+    // file: 模式下，OTEL_LOG_USER_PROMPTS 不影响文件内容
     expect(analysis.requestFiles).toBeGreaterThan(0);
-    // 观察：用户 prompt 是否被移除/脱敏
-    // 这是观察性断言 — 先宽松，根据实际结果精确化
-    console.error('[case-2] hasUserPromptContent:', analysis.hasUserPromptContent);
+    expect(analysis.hasUserPromptContent).toBe(true); // 用户 prompt 仍然存在
+    // request size 与基线在同一量级（~77KB），微小差异来自时间戳等动态内容
+    expect(analysis.requestSize).toBeGreaterThan(70000);
 
     expect(result.trim().length).toBeGreaterThan(0);
     prettyFormatJsonFiles(dir);
@@ -287,7 +292,8 @@ describe('OTEL 日志选项矩阵', () => {
 
   /**
    * Case 4: OTEL_LOG_TOOL_DETAILS=false — 禁用工具详情记录
-   * 预期：request 中 tools 字段被移除或简化（无 input_schema）
+   * 实验结论：在 file: 模式下，此变量不影响文件内容。tools 定义仍然完整记录。
+   * 此变量仅影响 OTLP span 导出时是否包含工具定义属性。
    */
   it('case-4 OTEL_LOG_TOOL_DETAILS=false', async () => {
     const dir = createTimestampDir('otel-log-options/case-4-no-tool-details');
@@ -303,12 +309,11 @@ describe('OTEL 日志选项矩阵', () => {
     const analysis = analyzeLogDir(dir);
     console.error('\n[case-4 no-tool-details]', JSON.stringify(analysis, null, 2));
 
+    // file: 模式下，OTEL_LOG_TOOL_DETAILS 不影响文件内容
     expect(analysis.requestFiles).toBeGreaterThan(0);
-    // 观察：tools 是否被移除或简化
-    console.error('[case-4] hasTools:', analysis.hasTools);
-    console.error('[case-4] toolsCount:', analysis.toolsCount);
-    console.error('[case-4] hasToolInputSchema:', analysis.hasToolInputSchema);
-    console.error('[case-4] requestSize vs baseline — 如果 tools 被移除，size 应显著减小');
+    expect(analysis.hasTools).toBe(true);
+    expect(analysis.toolsCount).toBeGreaterThan(0);
+    expect(analysis.hasToolInputSchema).toBe(true); // input_schema 仍然存在
 
     expect(result.trim().length).toBeGreaterThan(0);
     prettyFormatJsonFiles(dir);
@@ -343,7 +348,8 @@ describe('OTEL 日志选项矩阵', () => {
 
   /**
    * Case 6: OTEL_LOG_TOOL_CONTENT=false — 禁用工具内容记录（需触发工具调用）
-   * 预期：多轮对话中 tool_result 的 content 被脱敏或移除
+   * 实验结论：在 file: 模式下，此变量不影响文件内容。tool_result content 仍然完整记录。
+   * 此变量仅影响 OTLP span 导出时是否包含工具输入/输出内容属性。
    */
   it('case-6 OTEL_LOG_TOOL_CONTENT=false（触发工具调用）', async () => {
     const dir = createTimestampDir('otel-log-options/case-6-no-tool-content');
@@ -359,14 +365,13 @@ describe('OTEL 日志选项矩阵', () => {
     const analysis = analyzeLogDir(dir);
     console.error('\n[case-6 no-tool-content]', JSON.stringify(analysis, null, 2));
 
-    // 应该有多轮（工具调用 → 工具结果 → 最终回复）
-    console.error('[case-6] requestFiles:', analysis.requestFiles);
-    console.error('[case-6] hasToolResultMessages:', analysis.hasToolResultMessages);
-    console.error('[case-6] hasToolResultContent:', analysis.hasToolResultContent);
-    console.error('[case-6] hasToolUseInResponse:', analysis.hasToolUseInResponse);
-    console.error('[case-6] hasToolUseInput:', analysis.hasToolUseInput);
+    // 多轮对话：第一轮 request → tool_use response → 第二轮 request (含 tool_result) → final response
+    expect(analysis.requestFiles).toBe(2);
+    expect(analysis.responseFiles).toBe(2);
+    // file: 模式下，tool_result content 仍然完整存在
+    expect(analysis.hasToolResultMessages).toBe(true);
+    expect(analysis.hasToolResultContent).toBe(true);
 
-    expect(analysis.requestFiles).toBeGreaterThan(0);
     expect(result.trim().length).toBeGreaterThan(0);
     prettyFormatJsonFiles(dir);
   }, 120000);
@@ -402,8 +407,8 @@ describe('OTEL 日志选项矩阵', () => {
 
   /**
    * Case 8: 全部 false — 最小日志模式
-   * 预期：日志文件仍然产出（OTEL_LOG_RAW_API_BODIES 控制是否写文件），
-   *        但内容被大幅精简
+   * 实验结论：file: 模式始终输出完整的原始 API body，不受其他三个变量影响。
+   * 文件大小与全部 true 完全一致。
    */
   it('case-8 全部 false（最小日志）', async () => {
     const dir = createTimestampDir('otel-log-options/case-8-all-false');
@@ -421,12 +426,12 @@ describe('OTEL 日志选项矩阵', () => {
     const analysis = analyzeLogDir(dir);
     console.error('\n[case-8 all-false]', JSON.stringify(analysis, null, 2));
 
-    console.error('[case-8] requestSize:', analysis.requestSize);
-    console.error('[case-8] hasUserPromptContent:', analysis.hasUserPromptContent);
-    console.error('[case-8] hasToolInputSchema:', analysis.hasToolInputSchema);
-    console.error('[case-8] hasToolResultContent:', analysis.hasToolResultContent);
+    // 即使全部 false，file: 模式仍然输出完整内容
+    expect(analysis.requestFiles).toBe(2);
+    expect(analysis.hasUserPromptContent).toBe(true);
+    expect(analysis.hasToolInputSchema).toBe(true);
+    expect(analysis.hasToolResultContent).toBe(true);
 
-    expect(analysis.requestFiles).toBeGreaterThan(0);
     expect(result.trim().length).toBeGreaterThan(0);
     prettyFormatJsonFiles(dir);
   }, 120000);
