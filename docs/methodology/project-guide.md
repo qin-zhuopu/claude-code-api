@@ -266,6 +266,7 @@ Select-String -Path "test\integration\tmp\**\*.request.json" -Pattern "greet|jok
 | `stream-tool-bash.spec.ts` | `stream-tool-bash-behavior.md` |
 | `stream-tool-croncreate.spec.ts` | `stream-tool-croncreate-behavior.md` |
 | `stream-tool-crondelete.spec.ts` | `stream-tool-crondelete-behavior.md` |
+| `stream-tool-cronlist.spec.ts` | `stream-tool-cronlist-behavior.md` |
 | `skill-injection-matrix.spec.ts` | `custom-skill-injection.md` *(早期文件)* |
 | `system-prompt-matrix.spec.ts` | `system-prompt-options.md` *(早期文件)* |
 
@@ -301,6 +302,7 @@ Select-String -Path "test\integration\tmp\**\*.request.json" -Pattern "greet|jok
 | `raw/stream-tool-bash-behavior.md` | Bash 工具流式调用（input_json_delta 拼接、成功/失败 tool_result 双格式、tool_progress 频率、Vue3+Element Plus 终端风格渲染方案） |
 | `raw/stream-tool-croncreate-behavior.md` | CronCreate 流式工具调用（瞬时工具、tool_result 返回 job ID + humanSchedule + recurring/durable 结构、零 tool_progress、Vue3+Element Plus 定时任务卡片渲染方案） |
 | `raw/stream-tool-crondelete-behavior.md` | CronDelete 流式工具调用（瞬时工具、成功 tool_result 返回 {id}、失败 tool_result 为错误字符串、4 次 input_json_delta、零 tool_progress、Vue3+Element Plus 取消任务卡片渲染方案） |
+| `raw/stream-tool-cronlist-behavior.md` | CronList 流式工具调用（空参数工具 input={}、固定 3 次 input_json_delta、tool_result 返回 {jobs:[{id,cron,humanSchedule,prompt,recurring?,durable?}]} 任务列表数组、零 tool_progress、Vue3+Element Plus 任务列表表格渲染方案） |
 
 > 每次新增实验文档后，更新本节索引。
 
@@ -320,6 +322,7 @@ Select-String -Path "test\integration\tmp\**\*.request.json" -Pattern "greet|jok
 | `stream-tool-bash.spec.ts` | Bash 工具流式事件观察（6 cases），含成功/失败 tool_result 差异、input_json_delta 拼接、SSE 对比、permissionMode |
 | `stream-tool-croncreate.spec.ts` | CronCreate 工具流式事件观察（6 cases），含 recurring/one-shot/durable 三模式对比、tool_result 结构化数据、零 tool_progress、SSE 前端视角 |
 | `stream-tool-crondelete.spec.ts` | CronDelete 工具流式事件观察（6 cases），含成功/失败 tool_result 双格式对比、input_json_delta 4 次推送、先创建再删除三轮交互、SSE 前端视角 |
+| `stream-tool-cronlist.spec.ts` | CronList 工具流式事件观察（6 cases），含空参数 input={}、固定 3 次 input_json_delta、多任务列表 tool_result 格式、先创建再列出多轮交互、SSE 前端视角 |
 
 ## 执行命令
 
