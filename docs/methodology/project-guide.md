@@ -259,6 +259,7 @@ Select-String -Path "test\integration\tmp\**\*.request.json" -Pattern "greet|jok
 | `otel-log-options.spec.ts` | `otel-log-options-behavior.md` |
 | `conn-retry.spec.ts` | `conn-retry-behavior.md` |
 | `agent-shared-mechanism.spec.ts` | `agent-shared-mechanism-behavior.md` |
+| `query-user-interaction.spec.ts` | `tool-user-interaction-behavior.md` |
 | `skill-injection-matrix.spec.ts` | `custom-skill-injection.md` *(早期文件)* |
 | `system-prompt-matrix.spec.ts` | `system-prompt-options.md` *(早期文件)* |
 
@@ -287,6 +288,7 @@ Select-String -Path "test\integration\tmp\**\*.request.json" -Pattern "greet|jok
 | `raw/tool-ask-user-question-behavior.md` | AskUserQuestion 工具行为的双环境交叉对比实验 |
 | `raw/conn-retry-behavior.md` | SDK 自动重试行为（连接失败/超时/错误时的重试策略、参数、退避算法） |
 | `raw/agent-shared-mechanism-behavior.md` | CLI 与 SDK 的 Agent 共享机制（filesystem vs programmatic agent 行为差异） |
+| `raw/tool-user-interaction-behavior.md` | SDK 工具-用户交互机制全景（权限确认、AskUserQuestion、MCP Elicitation、User Dialog、多轮对话） |
 
 > 每次新增实验文档后，更新本节索引。
 
