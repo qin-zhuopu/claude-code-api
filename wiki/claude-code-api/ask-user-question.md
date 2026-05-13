@@ -1,7 +1,7 @@
 # AskUserQuestion 工具详解
 
-**Sources**: [raw/claude-code-api/ask-user-question.md](../../raw/claude-code-api/ask-user-question.md)  
-**Updated**: 2026-05-12
+**Sources**: [raw/agent-tool-ask-user-question-behavior.md](../../raw/agent-tool-ask-user-question-behavior.md)
+**Updated**: 2026-05-13
 
 ## 概述
 
@@ -298,6 +298,57 @@ tools: ["Read", "Glob", "Grep"]
 - **[`Bash`](bash.md)**：通常需要通过 `canUseTool` 进行权限批准
 - **[`Write`](write.md)**：通常需要通过 `canUseTool` 进行权限批准
 - **[`Skill`](skill.md)**：可以调用使用 AskUserQuestion 的技能
+
+## 观察性测试验证结果
+
+以下结论来自 `test/integration/agent-tool-ask-user-question.spec.ts`（16 个测试用例，2 环境 × 8 用例）的双环境交叉对比验证：
+
+**环境**: Jereh (`http://10.1.3.115:4000` + `Jereh-LLM-NO-THINK-V1`) / GLM (`open.bigmodel.cn` + `glm-4.7`)
+
+### SDK 行为与 LLM 后端无关
+
+交叉对比确认：toolsCount、schema 结构、description 长度等指标在两组环境下**完全一致**，差异仅 14 bytes（动态时间戳）。LLM 调用行为也一致：两组均成功触发 AskUserQuestion 并处理回调。
+
+### input_schema 完整结构
+
+Schema 包含 4 个顶层属性（不止 questions）：
+
+| 属性 | 类型 | required | 说明 |
+|------|------|----------|------|
+| `questions` | array | **是** | 1-4 个问题 |
+| `answers` | object (string→string) | 否 | 用户回答映射 |
+| `annotations` | object | 否 | 每题可选注释（preview/notes） |
+| `metadata` | object | 否 | 追踪元数据（source 字段） |
+
+### previewFormat 的实际影响
+
+`toolConfig.askUserQuestion.previewFormat` **不改变 schema 结构**（`preview` 字段始终存在于 options schema 中），而是改变 tool description 的内容：
+
+| previewFormat | description 长度 | 效果 |
+|---------------|-----------------|------|
+| 未设置（默认） | ~1074 chars | 最短，无预览渲染说明 |
+| `'html'` | ~1667 chars | 包含 HTML 渲染指南 |
+| `'markdown'` | ~1763 chars | 包含 markdown/ASCII 渲染指南 |
+
+默认模式 description 最短（节省 token），仅在需要预览功能时设置 `previewFormat`。
+
+### LLM 调用时的注意事项
+
+1. **multiSelect 省略**: 虽然 schema 中 `multiSelect` 是 required 字段，LLM 实际调用时可能省略（默认 false）
+2. **格式错误重试**: LLM 偶尔生成扁平化的错误格式（`{ head, question, options: "..." }` 而非 `{ questions: [...] }`），SDK 会返回 InputValidationError，LLM 自动重试
+3. **触发策略**: 需要明确指示（"Use the AskUserQuestion tool to..."），否则 LLM 可能直接文本回答
+
+### tool_result 格式
+
+SDK 将 canUseTool 的 `updatedInput` 转换为固定格式的 tool_result：
+
+```
+User has answered your questions: "问题文本"="选项label". You can now continue with the user's answers in mind.
+```
+
+### 测试文件
+
+完整测试用例：`test/integration/agent-tool-ask-user-question.spec.ts`（16 cases，~136s）
 
 ## 另请参阅
 
