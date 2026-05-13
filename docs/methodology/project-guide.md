@@ -268,6 +268,7 @@ Select-String -Path "test\integration\tmp\**\*.request.json" -Pattern "greet|jok
 | `stream-tool-crondelete.spec.ts` | `stream-tool-crondelete-behavior.md` |
 | `stream-tool-cronlist.spec.ts` | `stream-tool-cronlist-behavior.md` |
 | `stream-tool-edit.spec.ts` | `stream-tool-edit-behavior.md` |
+| `stream-tool-enterworktree.spec.ts` | `stream-tool-enterworktree-behavior.md` |
 | `skill-injection-matrix.spec.ts` | `custom-skill-injection.md` *(早期文件)* |
 | `system-prompt-matrix.spec.ts` | `system-prompt-options.md` *(早期文件)* |
 
@@ -305,6 +306,7 @@ Select-String -Path "test\integration\tmp\**\*.request.json" -Pattern "greet|jok
 | `raw/stream-tool-crondelete-behavior.md` | CronDelete 流式工具调用（瞬时工具、成功 tool_result 返回 {id}、失败 tool_result 为错误字符串、4 次 input_json_delta、零 tool_progress、Vue3+Element Plus 取消任务卡片渲染方案） |
 | `raw/stream-tool-cronlist-behavior.md` | CronList 流式工具调用（空参数工具 input={}、固定 3 次 input_json_delta、tool_result 返回 {jobs:[{id,cron,humanSchedule,prompt,recurring?,durable?}]} 任务列表数组、零 tool_progress、Vue3+Element Plus 任务列表表格渲染方案） |
 | `raw/stream-tool-edit-behavior.md` | Edit 流式工具调用（read-before-edit 导致 3 轮 API 调用、成功 tool_result 含 structuredPatch unified diff、失败 tool_result 为错误字符串、6 次 input_json_delta、零 tool_progress、Vue3+Element Plus Diff 视图渲染方案） |
+| `raw/stream-tool-enterworktree-behavior.md` | EnterWorktree 流式工具调用（瞬时工具、成功 tool_result 含 {worktreePath, worktreeBranch, message} 结构化对象、失败 tool_result 为错误字符串、4 次 input_json_delta、零 tool_progress、Vue3+Element Plus worktree 卡片渲染方案） |
 
 > 每次新增实验文档后，更新本节索引。
 
@@ -326,6 +328,7 @@ Select-String -Path "test\integration\tmp\**\*.request.json" -Pattern "greet|jok
 | `stream-tool-crondelete.spec.ts` | CronDelete 工具流式事件观察（6 cases），含成功/失败 tool_result 双格式对比、input_json_delta 4 次推送、先创建再删除三轮交互、SSE 前端视角 |
 | `stream-tool-cronlist.spec.ts` | CronList 工具流式事件观察（6 cases），含空参数 input={}、固定 3 次 input_json_delta、多任务列表 tool_result 格式、先创建再列出多轮交互、SSE 前端视角 |
 | `stream-tool-edit.spec.ts` | Edit 工具流式事件观察（5 cases），含 read-before-edit 三轮交互、成功 tool_result 结构化 structuredPatch diff、失败 tool_result 错误字符串、input_json_delta 6 次推送、SSE 前端视角 |
+| `stream-tool-enterworktree.spec.ts` | EnterWorktree 工具流式事件观察（6 cases），含成功/失败/非 git 三种 tool_result 格式对比、input_json_delta 4 次推送、零 tool_progress、SSE 前端视角 |
 
 ## 执行命令
 
