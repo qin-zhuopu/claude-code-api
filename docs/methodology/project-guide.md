@@ -263,6 +263,7 @@ Select-String -Path "test\integration\tmp\**\*.request.json" -Pattern "greet|jok
 | `hook-pre-tool-use.spec.ts` | `hook-pre-tool-use-behavior.md` |
 | `stream-event-types.spec.ts` | `stream-event-types-behavior.md` |
 | `stream-ask-user-question.spec.ts` | `stream-ask-user-question-behavior.md` |
+| `stream-tool-bash.spec.ts` | `stream-tool-bash-behavior.md` |
 | `skill-injection-matrix.spec.ts` | `custom-skill-injection.md` *(早期文件)* |
 | `system-prompt-matrix.spec.ts` | `system-prompt-options.md` *(早期文件)* |
 
@@ -295,6 +296,7 @@ Select-String -Path "test\integration\tmp\**\*.request.json" -Pattern "greet|jok
 | `raw/hook-pre-tool-use-behavior.md` | SDK Hook PreToolUse 机制（参数获取、deny 拦截、updatedInput 修改、多 hook 优先级、master agent 直接使用） |
 | `raw/stream-event-types-behavior.md` | SDK 流式事件类型全景（27 种消息类型、stream_event 内部结构、工具调用事件流、Vue3+Element Plus 渲染方案） |
 | `raw/stream-ask-user-question-behavior.md` | AskUserQuestion 流式工具调用（input_json_delta 拼接、tool_result 格式、状态更新频率、Vue3+Element Plus 表单渲染方案） |
+| `raw/stream-tool-bash-behavior.md` | Bash 工具流式调用（input_json_delta 拼接、成功/失败 tool_result 双格式、tool_progress 频率、Vue3+Element Plus 终端风格渲染方案） |
 
 > 每次新增实验文档后，更新本节索引。
 
@@ -311,6 +313,7 @@ Select-String -Path "test\integration\tmp\**\*.request.json" -Pattern "greet|jok
 | `tool-ask-user-question.spec.ts` | AskUserQuestion 工具测试，含双环境交叉对比、canUseTool 回调 |
 | `stream-event-types.spec.ts` | SDK 流式事件类型全景观察（6 cases），含 SSE 解析、事件分类、工具调用事件流分析 |
 | `stream-ask-user-question.spec.ts` | AskUserQuestion 流式事件观察（5 cases），含 input_json_delta 拼接、tool_result 格式、SSE 前端视角 |
+| `stream-tool-bash.spec.ts` | Bash 工具流式事件观察（6 cases），含成功/失败 tool_result 差异、input_json_delta 拼接、SSE 对比、permissionMode |
 
 ## 执行命令
 
