@@ -257,6 +257,7 @@ Select-String -Path "test\integration\tmp\**\*.request.json" -Pattern "greet|jok
 | `tool-agent.spec.ts` | `tool-agent-behavior.md` |
 | `tool-ask-user-question.spec.ts` | `tool-ask-user-question-behavior.md` |
 | `otel-log-options.spec.ts` | `otel-log-options-behavior.md` |
+| `conn-retry.spec.ts` | `conn-retry-behavior.md` |
 | `skill-injection-matrix.spec.ts` | `custom-skill-injection.md` *(早期文件)* |
 | `system-prompt-matrix.spec.ts` | `system-prompt-options.md` *(早期文件)* |
 
@@ -283,6 +284,7 @@ Select-String -Path "test\integration\tmp\**\*.request.json" -Pattern "greet|jok
 | `raw/otel-log-options-behavior.md` | OTEL 日志选项的 10 组对比实验 |
 | `raw/tool-agent-behavior.md` | Agent 工具行为的观察性实验 |
 | `raw/tool-ask-user-question-behavior.md` | AskUserQuestion 工具行为的双环境交叉对比实验 |
+| `raw/conn-retry-behavior.md` | SDK 自动重试行为（连接失败/超时/错误时的重试策略、参数、退避算法） |
 
 > 每次新增实验文档后，更新本节索引。
 
