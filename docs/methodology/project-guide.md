@@ -272,6 +272,7 @@ Select-String -Path "test\integration\tmp\**\*.request.json" -Pattern "greet|jok
 | `stream-tool-exitworktree.spec.ts` | `stream-tool-exitworktree-behavior.md` |
 | `stream-tool-glob.spec.ts` | `stream-tool-glob-behavior.md` |
 | `stream-tool-grep.spec.ts` | `stream-tool-grep-behavior.md` |
+| `stream-tool-listmcpresources.spec.ts` | `stream-tool-listmcpresources-behavior.md` |
 | `skill-injection-matrix.spec.ts` | `custom-skill-injection.md` *(早期文件)* |
 | `system-prompt-matrix.spec.ts` | `system-prompt-options.md` *(早期文件)* |
 
@@ -313,6 +314,7 @@ Select-String -Path "test\integration\tmp\**\*.request.json" -Pattern "greet|jok
 | `raw/stream-tool-exitworktree-behavior.md` | ExitWorktree 流式工具调用（瞬时工具、成功 tool_result 含 {action, originalCwd, worktreePath, worktreeBranch?, discardedFiles?, discardedCommits?, message} 结构化对象、失败 tool_result 为错误字符串、4-5 次 input_json_delta、零 tool_progress、remove 模式需 discard_changes 重试、Vue3+Element Plus 退出 worktree 卡片渲染方案） |
 | `raw/stream-tool-glob-behavior.md` | Glob 流式工具调用（瞬时工具、input={pattern:string} 单参数、固定 4 次 input_json_delta、tool_result 含 {filenames:string[],durationMs,numFiles,truncated} 结构化对象、零 tool_progress、截断上限 100 文件、Vue3+Element Plus 文件列表表格渲染方案） |
 | `raw/stream-tool-grep-behavior.md` | Grep 流式工具调用（瞬时工具、input={pattern}+12 可选参数、5-7 次 input_json_delta、tool_result 含 {mode,filenames,numFiles,content?,numLines?} 结构化对象、三种 output_mode 差异、零 tool_progress、Vue3+Element Plus 搜索结果/代码行渲染方案） |
+| `raw/stream-tool-listmcpresources-behavior.md` | ListMcpResourcesTool 流式工具调用（需 MCP 服务器前置条件、input={server?} 可选参数、3-4 次 input_json_delta、tool_result 返回 {uri,name,mimeType?,description?,server}[] 资源数组、零 tool_progress、瞬时工具、Vue3+Element Plus 资源表格渲染方案） |
 
 > 每次新增实验文档后，更新本节索引。
 
@@ -338,6 +340,7 @@ Select-String -Path "test\integration\tmp\**\*.request.json" -Pattern "greet|jok
 | `stream-tool-exitworktree.spec.ts` | ExitWorktree 工具流式事件观察（6 cases），含 keep/remove 两种 action 对比、remove 重试（discard_changes）场景、不在 worktree 中调用的 no-op 错误、先创建再退出的多轮交互、SSE 前端视角 |
 | `stream-tool-glob.spec.ts` | Glob 工具流式事件观察（6 cases），含有结果/无结果/截断三种 tool_result 格式对比、input={pattern} 单参数、固定 4 次 input_json_delta、零 tool_progress、SSE 前端视角 |
 | `stream-tool-grep.spec.ts` | Grep 工具流式事件观察（6 cases），含 files_with_matches/content 两种 output_mode 的 tool_result 格式对比、input={pattern}+可选参数、5-7 次 input_json_delta、零 tool_progress、SSE 前端视角 |
+| `stream-tool-listmcpresources.spec.ts` | ListMcpResourcesTool 流式事件观察（6 cases），含 MCP 服务器配置、无参数/带参数两种 input 对比、无 MCP 服务器时工具不可用、SSE 前端视角、关闭流式对比 |
 
 ## 执行命令
 
