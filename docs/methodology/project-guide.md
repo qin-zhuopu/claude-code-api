@@ -277,6 +277,7 @@ Select-String -Path "test\integration\tmp\**\*.request.json" -Pattern "greet|jok
 | `stream-tool-monitor.spec.ts` | `stream-tool-monitor-behavior.md` |
 | `stream-tool-notebookedit.spec.ts` | `stream-tool-notebookedit-behavior.md` |
 | `stream-tool-pushnotification.spec.ts` | `stream-tool-pushnotification-behavior.md` |
+| `stream-tool-read.spec.ts` | `stream-tool-read-behavior.md` |
 | `skill-injection-matrix.spec.ts` | `custom-skill-injection.md` *(早期文件)* |
 | `system-prompt-matrix.spec.ts` | `system-prompt-options.md` *(早期文件)* |
 
@@ -323,6 +324,7 @@ Select-String -Path "test\integration\tmp\**\*.request.json" -Pattern "greet|jok
 | `raw/stream-tool-monitor-behavior.md` | Monitor 流式工具调用（条件性可用工具、需 Anthropic 直连端点 + 遥测启用 + v2.1.98+、SDK 无 MonitorInput/MonitorOutput 类型定义、input={command,description,timeout_ms?,persistent?}、非 Anthropic 端点时 LLM 三级回退策略（Bash→Skill→文本）、逐行输出推送机制（推断）、Vue3+Element Plus 实时监控终端渲染方案） |
 | `raw/stream-tool-notebookedit-behavior.md` | NotebookEdit 流式工具调用（需权限、read-before-edit 导致 3 轮 API 调用、input={notebook_path,cell_id?,new_source,cell_type?,edit_mode?}、成功 tool_result 含 NotebookEditOutput 结构化对象{new_source,cell_type,language,edit_mode,cell_id,error,notebook_path,original_file,updated_file}、失败 tool_result 为错误字符串、6-8 次 input_json_delta、零 tool_progress、瞬时工具、insert/replace/delete 三种模式对比、Vue3+Element Plus Notebook Diff 视图渲染方案） |
 | `raw/stream-tool-pushnotification-behavior.md` | PushNotification 流式工具调用（条件性可用工具、需 Anthropic 直连端点、非 Anthropic 端点时工具不出现在 tools 列表、SDK 无显式类型定义、input_schema 推断含 message 字段、tool_result 格式推断、LLM 三级回退策略（Bash→Skill→文本）、LLM 幻觉检测（声称成功但实际未调用）、零 tool_progress（推断）、Vue3+Element Plus 可用性检测+幻觉检测+条件渲染方案） |
+| `raw/stream-tool-read-behavior.md` | Read 流式工具调用（瞬时工具、input={file_path,offset?,limit?,pages?}、成功 tool_result 含 {type:"text"/"image"/"pdf",file:{filePath,content,numLines,startLine,totalLines}}、失败 tool_result 为错误字符串、固定 4 次 input_json_delta、零 tool_progress、Vue3+Element Plus 文件内容卡片渲染方案） |
 
 > 每次新增实验文档后，更新本节索引。
 
@@ -353,6 +355,7 @@ Select-String -Path "test\integration\tmp\**\*.request.json" -Pattern "greet|jok
 | `stream-tool-monitor.spec.ts` | Monitor 工具流式事件观察（6 cases），含条件性可用机制（需 Anthropic 端点 + 遥测）、工具不可用时 LLM 三级回退策略分析、input_schema 文档推断、tool_result 格式推断、SSE 前端视角 |
 | `stream-tool-notebookedit.spec.ts` | NotebookEdit 工具流式事件观察（6 cases），含 replace/insert/delete 三种 edit_mode 对比、成功 tool_result 结构化 NotebookEditOutput、失败 tool_result 错误字符串、read-before-edit 三轮交互、input_json_delta 6-8 次推送、零 tool_progress、SSE 前端视角 |
 | `stream-tool-pushnotification.spec.ts` | PushNotification 工具流式事件观察（6 cases），含条件性可用机制（需 Anthropic 直连端点）、非 Anthropic 端点时工具不可用、LLM 三级回退策略（Bash→Skill→文本）、LLM 幻觉检测（声称成功但实际调用 Skill）、input_schema 推断、tool_result 格式推断、SSE 前端视角 |
+| `stream-tool-read.spec.ts` | Read 工具流式事件观察（6 cases），含文本/图片/PDF 三种文件类型读取、成功/失败 tool_result 双格式对比、offset/limit/pages 参数影响、固定 4 次 input_json_delta、零 tool_progress、SSE 前端视角 |
 
 ## 执行命令
 
