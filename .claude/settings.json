@@ -1,8 +1,0 @@
-{
-  "env": {
-    "OTEL_LOGS_EXPORTER": "none",
-    "OTEL_METRICS_EXPORTER": "none",
-    "OTEL_TRACES_EXPORTER": "none",
-    "OTEL_LOG_RAW_API_BODIES": "file:.claude/api-bodies"
-  }
-}

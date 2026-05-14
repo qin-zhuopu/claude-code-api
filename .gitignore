@@ -47,3 +47,4 @@ skills-lock.json
 # Project specific
 .obsidian/
 test/demos/logs/
+.log-claude
