@@ -39,6 +39,8 @@ raw/claude-code-docs/
 .agents/
 .claude/skills/
 .claude/api-bodies/
+.claude/scheduled_tasks.*
+.claude/worktrees/
 skills-lock.json
 
 
