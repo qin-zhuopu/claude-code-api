@@ -12,10 +12,11 @@ disallowedTools: Agent
 
 1. 该工具的 **tool_use 调用格式**（input_schema、实际 input 示例）
 2. 该工具的 **tool_result 返回值格式**（完整结构、字段含义）
-3. 该工具在流式输出中的 **事件序列**（stream_event 的推送顺序和频率）
-4. 工具调用过程中 **SDK 推送了多少次状态更新**？哪些是增量的？
-5. 如果用 **Vue3 + Element Plus**，应该如何渲染这次工具调用的返回值？
-6. 工具调用的过程当中，还会需要**不断地修改状态**吗？SDK 会推送很多次状态更新吗？
+3. 该工具**调用报错时的错误信息格式**（is_error 标志、错误文本结构、LLM 重试行为）
+4. 该工具在流式输出中的 **事件序列**（stream_event 的推送顺序和频率）
+5. 工具调用过程中 **SDK 推送了多少次状态更新**？哪些是增量的？
+6. 如果用 **Vue3 + Element Plus**，应该如何渲染这次工具调用的返回值？（含正常和错误两种状态）
+7. 工具调用的过程当中，还会需要**不断地修改状态**吗？SDK 会推送很多次状态更新吗？
 
 **注意：必须用流式输出（`includePartialMessages: true`）进行观察。**
 
@@ -83,16 +84,22 @@ disallowedTools: Agent
 - **必须使用 `includePartialMessages: true`** 开启流式输出
 - 遵循项目模板：BASE_ENV、createTimestampDir、collectSSEEvents 模式
 - 设计以下实验：
-  - **实验 A**：触发该工具调用，收集完整事件流
+  - **实验 A**：触发该工具调用，收集完整事件流（正常成功路径）
   - **实验 B**：观察 `tool_progress` 事件的推送频率和内容
   - **实验 C**：观察 `tool_use_summary` 是否出现
   - **实验 D**：对比 `includePartialMessages: false` 时的事件差异
+  - **实验 E**：**触发工具调用报错**，观察错误信息的格式和事件流
+    - 构造会导致工具失败的输入（如：Read 不存在的文件、Bash 执行失败命令、Edit 匹配不到的字符串、AskUserQuestion 缺少 required 字段等）
+    - 观察 tool_result 中的错误信息结构（`is_error`、错误文本格式）
+    - 观察 LLM 收到错误后是否重试、重试的事件流差异
+    - 观察错误场景下 `tool_progress` 和 `tool_use_summary` 的行为
 - 重点捕获：
   - `content_block_start(tool_use)` 的完整结构（id、name）
   - `input_json_delta` 的推送次数和内容
   - `assistant` 消息中 `tool_use` block 的完整 input
-  - `user` 消息中 `tool_result` 的完整结构
+  - `user` 消息中 `tool_result` 的完整结构（**成功和失败两种**）
   - `tool_progress` 的 `tool_name`、`elapsed_time_seconds`、推送间隔
+  - **错误场景**：tool_result 中的 `is_error` 标志、错误消息文本格式、SDK 是否包装错误
 
 ### 3. 迭代验证
 
@@ -105,6 +112,11 @@ disallowedTools: Agent
   - tool_result 的返回值结构（字段名、类型、嵌套层级）
   - stream_event 的推送顺序和数量
   - tool_progress 的推送频率
+  - **错误场景断言**：
+    - tool_result 中是否有 `is_error: true` 标志
+    - 错误消息的文本格式（InputValidationError / ToolExecutionError / PermissionDenied 等）
+    - 错误后 LLM 是否发起新一轮 tool_use（重试行为）
+    - 错误场景的 num_turns 是否增加
 
 ### 4. 输出洞察文档
 
@@ -137,31 +149,40 @@ disallowedTools: Agent
 
 ### 完整结构（来自 user 消息的 tool_result）
 ### 字段说明
+### 错误场景的 tool_result 结构
 
-## 三、流式事件序列
+## 三、工具调用报错行为
+
+### 错误触发条件（如何构造失败输入）
+### 错误 tool_result 的完整格式（is_error、错误文本）
+### 错误后 LLM 的重试行为
+### 错误场景的事件流差异（对比正常路径）
+### Vue3 错误状态渲染方案
+
+## 四、流式事件序列
 
 ### 完整时间线（从 message_start 到 result）
 ### 各阶段事件数量统计
 
-## 四、状态更新机制
+## 五、状态更新机制
 
 ### tool_progress 推送分析
 ### SDK 推送频率统计
 ### 是否需要不断修改前端状态？
 
-## 五、Vue3 + Element Plus 渲染方案
+## 六、Vue3 + Element Plus 渲染方案
 
 ### 数据模型（TypeScript interface）
 ### 状态机设计
 ### 组件模板
 ### 关键交互处理（如果该工具需要用户交互）
 
-## 六、实验数据
+## 七、实验数据
 
 ### 实验矩阵
 ### 原始事件样本（关键事件的 JSON）
 
-## 七、未验证行为
+## 八、未验证行为
 ```
 
 ### 5. 更新索引
@@ -190,6 +211,7 @@ disallowedTools: Agent
 - **前端视角**：始终从 Vue3 + Element Plus 渲染的角度分析数据格式
 - **超时 120000ms**：每个 case 设 2 分钟超时
 - **关注状态更新频率**：明确回答"SDK 会推送多少次状态更新"这个问题
+- **错误路径必测**：每个工具都要构造失败输入，观察错误信息的格式和 LLM 重试行为
 
 ## 已有参考资料
 
