@@ -175,7 +175,8 @@ const ART_GUIDELINES = `## SVG setup
  */
 function extractWidgetFences(text: string): string[] {
   const matches: string[] = [];
-  const markerRegex = /`{1,3}show-widget`{0,3}/g;
+  // 必须至少 3 个反引号 — 排除行内代码 `show-widget` 的干扰
+  const markerRegex = /`{3}show-widget`{0,3}/g;
   let markerMatch;
   while ((markerMatch = markerRegex.exec(text)) !== null) {
     const afterMarker = text.slice(markerMatch.index + markerMatch[0].length);
@@ -636,24 +637,68 @@ describe('Widget 生成式 UI — LLM 遵循性观察', () => {
     prettyFormatJsonFiles(dir);
   }, 180000);
 
-  // Case 6: 对照组 — 无 widget 系统提示但 prompt 含"画图"
-  it('case-6 对照组：有完整系统提示但无 widget 能力声明', async () => {
-    const dir = createTimestampDir('widget-generative-ui/case-6-no-widget-prompt');
-    const systemPrompt = '你是一个数据可视化助手，擅长用图表展示数据。直接在回复中输出代码，不要使用任何工具。';
+  // Case 6: HTML 渲染嵌套 JSON 数据结构
+  // 测试非图表场景下 show-widget 的遵循性
+  it('case-6 HTML 渲染嵌套 JSON 数据结构', async () => {
+    const dir = createTimestampDir('widget-generative-ui/case-6-json-renderer');
+    const systemPrompt = WIDGET_SYSTEM_PROMPT + '\n\n' + CHART_GUIDELINES; // interactive 指南更适合，但 chart 也含 Core + UI Components
 
     const resultText = await runQuery({
-      prompt: '画一个展示月度收入趋势的折线图。数据：1月 32万，2月 45万，3月 38万，4月 52万，5月 48万，6月 61万',
+      prompt: `用 HTML 渲染以下嵌套 JSON 数据为一个可视化的树形结构卡片：
+
+{
+  "project": "CodePilot",
+  "version": "0.54.0",
+  "features": [
+    {
+      "name": "Widget System",
+      "status": "active",
+      "modules": ["chart", "diagram", "art", "interactive", "mockup"],
+      "config": { "maxChars": 3000, "cdnWhitelist": ["cdnjs.cloudflare.com", "esm.sh"] }
+    },
+    {
+      "name": "Session Manager",
+      "status": "beta",
+      "modules": ["continue", "resume", "fork"],
+      "config": { "maxTurns": 50, "persist": true }
+    },
+    {
+      "name": "Hook System",
+      "status": "stable",
+      "modules": ["preToolUse", "postToolUse", "notification"],
+      "config": { "timeout": 30000 }
+    }
+  ],
+  "stats": {
+    "totalFiles": 142,
+    "testCoverage": "78%",
+    "openIssues": { "bugs": 3, "features": 7, "enhancements": 12 }
+  }
+}
+
+要求：
+- 每个顶层 key 渲染为一个卡片
+- array 中的 object 渲染为子卡片列表
+- 嵌套的 object 用缩进展示
+- 用颜色区分不同数据类型（string=indigo, number=emerald, boolean=amber, array=sky, object=slate）`,
       systemPrompt,
       logDir: dir,
       noTools: true,
     });
 
     const analysis = analyzeWidgets(resultText);
-    printAnalysis('Case 6: 对照组（无 widget 提示）', analysis, resultText);
+    printAnalysis('Case 6: HTML 渲染嵌套 JSON', analysis, resultText);
 
-    // 对照组：没有 show-widget 格式指导，LLM 应该不会输出 show-widget 围栏
-    // 如果输出了，说明 LLM 之前见过这个格式（训练数据中有）
-    console.error(`[case-6] 是否意外输出 show-widget: ${analysis.hasAnyWidget}`);
+    console.error(`[case-6] 围栏数量: ${analysis.fenceCount}`);
+
+    if (analysis.hasAnyWidget && analysis.allParseable) {
+      const v = analysis.validations[0];
+      console.error(`[case-6] title: ${v.title}`);
+      console.error(`[case-6] widget_code 长度: ${v.widgetCodeLength}`);
+      console.error(`[case-6] widget_code 是否包含 <div>: ${v.widgetCodePreview?.includes('<div')}`);
+      // JSON 渲染器应该包含动态 HTML 结构
+      console.error(`[case-6] widget_code 是否包含 JSON 关键字: ${v.rawContent?.includes('CodePilot')}`);
+    }
 
     expect(resultText.trim().length).toBeGreaterThan(0);
 
