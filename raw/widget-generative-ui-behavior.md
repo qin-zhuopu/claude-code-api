@@ -166,7 +166,48 @@ CodePilot 的 `parseAllShowWidgets()` 已经很宽松，但可能还需要：
 
 ---
 
-## 未验证行为
+## 第二组实验：systemPrompt 模式变量
+
+### 实验设计
+
+固定 prompt（chart 折线图），只改变 `systemPrompt` 传入方式，观察对 `show-widget` 输出的影响。
+
+SDK 的 `systemPrompt` 参数有 4 种用法：
+
+| 模式 | 代码 | 实际 system 内容 |
+|------|------|-----------------|
+| 不设置 | 不传 `systemPrompt` | SDK 默认身份（~146 chars）|
+| string 追加 | `systemPrompt: "widget 提示"` | SDK 默认身份 + widget 提示 |
+| preset | `{type:'preset', preset:'claude_code'}` | 完整 Claude Code prompt（~25600 chars）|
+| preset + append | `{type:'preset', preset:'claude_code', append: "widget 提示"}` | 完整 CC prompt + widget 提示（~28800 chars）|
+
+### 结果矩阵
+
+| Case | 模式 | system 字符数 | SDK身份 | 完整CC | Widget提示 | 围栏数 |
+|------|------|-------------|---------|--------|-----------|--------|
+| 7 | 不设置 | 146 | ✅ | ❌ | ❌ | **0** |
+| 8 | string 追加 | 3,323 | ✅ | ❌ | ✅ | **0** |
+| 9 | preset | 25,628 | ✅ | ✅ | ❌ | **0** |
+| **10** | **preset + append** | **28,839** | **❌** | **✅** | **✅** | **1** ✅ |
+
+### 核心发现
+
+1. **Case 10 是 chart 场景唯一成功的组合！** `preset + append` 模式下 LLM 输出了合法的 `show-widget` 围栏。
+
+2. **完整 Claude Code prompt 是关键基底。** 单纯的 string 追加（Case 8）等同于之前的 Case 2（都是 0 围栏）。加上 25000+ 字符的完整 CC prompt 后，LLM 的指令遵循能力显著增强。
+
+3. **preset 模式会替换 SDK 默认身份。** Case 10 的 `hasSdkIdentity: false` 表明 preset 不是追加，而是用完整的 Claude Code 行为规范替换了简短的 SDK 身份声明。
+
+4. **单独的 widget 提示不够。** Case 8 有 widget 提示但没有完整 CC prompt，LLM 仍然输出 ` ```html `。说明 widget 格式指导需要建立在强指令遵循能力的基础上。
+
+### 实际应用建议
+
+对于需要 LLM 遵循 `show-widget` 格式的场景：
+- ❌ 不要只用 `systemPrompt: string` 追加 widget 提示
+- ✅ 使用 `systemPrompt: {type:'preset', preset:'claude_code', append: widget提示}` 组合
+- 原因：完整 Claude Code prompt 提供了更强的指令遵循框架
+
+---
 
 1. **Few-shot 强化效果**：在系统提示中加入完整示例是否能显著提高遵循率？
 2. **温度参数影响**：低温度（0.1-0.3）是否能提高格式稳定性？

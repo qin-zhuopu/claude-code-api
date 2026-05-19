@@ -444,7 +444,7 @@ function printAnalysis(label: string, analysis: ReturnType<typeof analyzeWidgets
 
 async function runQuery(options: {
   prompt: string;
-  systemPrompt?: string;
+  systemPrompt?: string | { type: 'preset'; preset: 'claude_code'; append?: string };
   logDir?: string;
   noTools?: boolean;
 }): Promise<string> {
@@ -460,7 +460,7 @@ async function runQuery(options: {
     effort: 'low',
   };
 
-  if (options.systemPrompt) {
+  if (options.systemPrompt !== undefined) {
     queryOptions.systemPrompt = options.systemPrompt;
   }
 
@@ -657,6 +657,136 @@ describe('Widget 生成式 UI — LLM 遵循性观察', () => {
 
     expect(resultText.trim().length).toBeGreaterThan(0);
 
+    prettyFormatJsonFiles(dir);
+  }, 180000);
+
+});
+
+// ====== 第二组实验：systemPrompt 模式变量 ======
+
+/** 分析请求日志中的 system prompt 结构 */
+function analyzeRequestSystem(dir: string) {
+  const { readdirSync, readFileSync } = require('fs');
+  const { join } = require('path');
+  const allFiles = readdirSync(dir);
+  const reqFiles = allFiles.filter((f: string) => f.endsWith('.request.json') && !f.includes('.pretty.'));
+  if (reqFiles.length === 0) return null;
+
+  const body = JSON.parse(readFileSync(join(dir, reqFiles.sort()[0]), 'utf-8'));
+  const system: any[] = body.system || [];
+  return {
+    blockCount: system.length,
+    totalChars: system.reduce((s: number, b: any) => s + (b.text?.length || 0), 0),
+    blocks: system.map((b: any, i: number) => ({
+      index: i,
+      chars: b.text?.length || 0,
+      preview: b.text?.substring(0, 80) || '',
+      cached: !!b.cache_control,
+    })),
+    hasSdkIdentity: system.some((b: any) => b.text?.includes('You are a Claude agent')),
+    hasFullClaudeCode: system.some((b: any) => (b.text?.length || 0) > 5000),
+    hasWidgetCapability: system.some((b: any) => b.text?.includes('show-widget')),
+  };
+}
+
+describe('Widget 生成式 UI — systemPrompt 模式变量', () => {
+
+  // 统一 prompt，只变 systemPrompt 模式
+  const CHART_PROMPT = '画一个展示月度收入趋势的折线图。数据：1月 32万，2月 45万，3月 38万，4月 52万，5月 48万，6月 61万。注意：不要使用任何工具，直接在回复中输出可视化代码。';
+  const WIDGET_FULL_PROMPT = WIDGET_SYSTEM_PROMPT + '\n\n' + CHART_GUIDELINES;
+
+  // Case 7: systemPrompt 不设置（SDK 默认身份）+ 无 widget 提示
+  it('case-7 systemPrompt 不设置 + 无 widget 提示', async () => {
+    const dir = createTimestampDir('widget-generative-ui/case-7-no-systemprompt');
+    const resultText = await runQuery({
+      prompt: CHART_PROMPT,
+      // systemPrompt 不传
+      logDir: dir,
+      noTools: true,
+    });
+
+    const analysis = analyzeWidgets(resultText);
+    const sysInfo = analyzeRequestSystem(dir);
+    printAnalysis('Case 7: systemPrompt 不设置', analysis, resultText);
+
+    console.error(`[case-7] system prompt blocks: ${sysInfo?.blockCount}, total: ${sysInfo?.totalChars} chars`);
+    console.error(`[case-7] hasSdkIdentity: ${sysInfo?.hasSdkIdentity}, hasWidgetCapability: ${sysInfo?.hasWidgetCapability}`);
+    console.error(`[case-7] 围栏数量: ${analysis.fenceCount}`);
+
+    expect(resultText.trim().length).toBeGreaterThan(0);
+    prettyFormatJsonFiles(dir);
+  }, 180000);
+
+  // Case 8: systemPrompt = string 追加（与 case-2 相同，对照用）
+  it('case-8 systemPrompt = string 追加 widget 提示', async () => {
+    const dir = createTimestampDir('widget-generative-ui/case-8-string-append');
+    const resultText = await runQuery({
+      prompt: CHART_PROMPT,
+      systemPrompt: WIDGET_FULL_PROMPT,
+      logDir: dir,
+      noTools: true,
+    });
+
+    const analysis = analyzeWidgets(resultText);
+    const sysInfo = analyzeRequestSystem(dir);
+    printAnalysis('Case 8: systemPrompt = string 追加', analysis, resultText);
+
+    console.error(`[case-8] system prompt blocks: ${sysInfo?.blockCount}, total: ${sysInfo?.totalChars} chars`);
+    console.error(`[case-8] hasSdkIdentity: ${sysInfo?.hasSdkIdentity}, hasWidgetCapability: ${sysInfo?.hasWidgetCapability}`);
+    console.error(`[case-8] 围栏数量: ${analysis.fenceCount}`);
+
+    expect(resultText.trim().length).toBeGreaterThan(0);
+    prettyFormatJsonFiles(dir);
+  }, 180000);
+
+  // Case 9: systemPrompt = preset claude_code（完整 Claude Code prompt，无 widget）
+  it('case-9 systemPrompt = preset claude_code（无 widget 提示）', async () => {
+    const dir = createTimestampDir('widget-generative-ui/case-9-preset-no-widget');
+    const resultText = await runQuery({
+      prompt: CHART_PROMPT,
+      systemPrompt: { type: 'preset', preset: 'claude_code' },
+      logDir: dir,
+      noTools: true,
+    });
+
+    const analysis = analyzeWidgets(resultText);
+    const sysInfo = analyzeRequestSystem(dir);
+    printAnalysis('Case 9: preset claude_code（无 widget）', analysis, resultText);
+
+    console.error(`[case-9] system prompt blocks: ${sysInfo?.blockCount}, total: ${sysInfo?.totalChars} chars`);
+    console.error(`[case-9] hasSdkIdentity: ${sysInfo?.hasSdkIdentity}, hasFullClaudeCode: ${sysInfo?.hasFullClaudeCode}`);
+    console.error(`[case-9] hasWidgetCapability: ${sysInfo?.hasWidgetCapability}`);
+    console.error(`[case-9] 围栏数量: ${analysis.fenceCount}`);
+
+    expect(resultText.trim().length).toBeGreaterThan(0);
+    prettyFormatJsonFiles(dir);
+  }, 180000);
+
+  // Case 10: systemPrompt = preset claude_code + append widget 提示
+  // 关键问题：完整 Claude Code prompt + widget 提示的组合效果如何？
+  it('case-10 systemPrompt = preset claude_code + append widget 提示', async () => {
+    const dir = createTimestampDir('widget-generative-ui/case-10-preset-append-widget');
+    const resultText = await runQuery({
+      prompt: CHART_PROMPT,
+      systemPrompt: { type: 'preset', preset: 'claude_code', append: WIDGET_FULL_PROMPT },
+      logDir: dir,
+      noTools: true,
+    });
+
+    const analysis = analyzeWidgets(resultText);
+    const sysInfo = analyzeRequestSystem(dir);
+    printAnalysis('Case 10: preset claude_code + append widget', analysis, resultText);
+
+    console.error(`[case-10] system prompt blocks: ${sysInfo?.blockCount}, total: ${sysInfo?.totalChars} chars`);
+    console.error(`[case-10] hasSdkIdentity: ${sysInfo?.hasSdkIdentity}, hasFullClaudeCode: ${sysInfo?.hasFullClaudeCode}`);
+    console.error(`[case-10] hasWidgetCapability: ${sysInfo?.hasWidgetCapability}`);
+    console.error(`[case-10] 围栏数量: ${analysis.fenceCount}`);
+
+    if (analysis.hasAnyWidget && analysis.allParseable) {
+      expect(analysis.allHaveTitleAndCode).toBe(true);
+    }
+
+    expect(resultText.trim().length).toBeGreaterThan(0);
     prettyFormatJsonFiles(dir);
   }, 180000);
 
