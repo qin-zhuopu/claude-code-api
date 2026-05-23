@@ -282,6 +282,7 @@ Select-String -Path "test\integration\tmp\**\*.request.json" -Pattern "greet|jok
 | `stream-tool-powershell.spec.ts` | `stream-tool-powershell-behavior.md` |
 | `widget-generative-ui.spec.ts` | `widget-generative-ui-behavior.md` |
 | `cli-rest-api.spec.ts` | `cli-rest-api-behavior.md` |
+| `cli-process-pool.spec.ts` | `cli-process-pool-behavior.md` |
 | `skill-injection-matrix.spec.ts` | `custom-skill-injection.md` *(早期文件)* |
 | `system-prompt-matrix.spec.ts` | `system-prompt-options.md` *(早期文件)* |
 
@@ -334,6 +335,7 @@ Select-String -Path "test\integration\tmp\**\*.request.json" -Pattern "greet|jok
 | `raw/session-reuse-methods-behavior.md` | 会话复用方法全景观察（7 组实验），continue/resume/forkSession/单次 query 多轮四种稳定方法性能对比（continue 快 42%、resume 快 53%、forkSession 慢 122%、单次 query 多轮快 45%），V2 session API 弃用分析，bridge/perpetual 实验性 API 风险评估，不同场景应用建议 |
 | `raw/widget-generative-ui-behavior.md` | Widget 生成式 UI LLM 遵循性观察（6 组实验），show-widget 围栏格式遵循性分析（格式不稳定、Chart.js 场景最差、SVG diagram/art 可行、JSON 完整性问题、宽松解析器设计） |
 | `raw/cli-rest-api-behavior.md` | CLI 进程直接通信实验，绕过 SDK 用 `--input-format stream-json` JSON 行协议操纵 CLI 进程，验证了 initialize 握手→user 消息→完整响应的全流程，JSON 协议逆向分析，REST API 转化方案 |
+| `raw/cli-process-pool-behavior.md` | CLI 多进程池架构验证（3 组实验），进程复用（result 后继续发消息）、多进程并发（两个进程同时运行）、输出流路由（每条消息带 session_id+uuid），N:1:N 架构设计（HTTP 客户端:会话:CLI 进程） |
 
 > 每次新增实验文档后，更新本节索引。
 
@@ -370,6 +372,7 @@ Select-String -Path "test\integration\tmp\**\*.request.json" -Pattern "greet|jok
 | `session-reuse-methods.spec.ts` | 会话复用方法观察（7 cases），含 continue/resume/forkSession/单次 query 多轮对话四种稳定方法对比，V2 session API 弃用分析，bridge/perpetual 实验性 API 风险评估，性能对比（continue 快 42%、resume 快 53%、forkSession 慢 122%、单次 query 多轮快 45%） |
 | `widget-generative-ui.spec.ts` | Widget 生成式 UI LLM 遵循性观察（6 cases），含 show-widget 围栏格式验证、JSON 解析、设计规则合规检查、多 widget 独立围栏测试、宽松 JSON 修复解析器 |
 | `cli-rest-api.spec.ts` | CLI 进程直接通信实验（1 case），绕过 SDK 直接 spawn claude 进程，验证 `--input-format stream-json` JSON 行协议的 initialize 握手和 user 消息通信 |
+| `cli-process-pool.spec.ts` | CLI 多进程池验证（3 cases），进程复用（单进程连续两条消息）、多进程并发（两个进程同时收发）、输出流路由（session_id/uuid 标识字段全景分析） |
 
 ## 执行命令
 
