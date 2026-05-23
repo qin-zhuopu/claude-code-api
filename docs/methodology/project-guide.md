@@ -281,6 +281,7 @@ Select-String -Path "test\integration\tmp\**\*.request.json" -Pattern "greet|jok
 | `stream-tool-readmcpresource.spec.ts` | `stream-tool-readmcpresource-behavior.md` |
 | `stream-tool-powershell.spec.ts` | `stream-tool-powershell-behavior.md` |
 | `widget-generative-ui.spec.ts` | `widget-generative-ui-behavior.md` |
+| `cli-rest-api.spec.ts` | `cli-rest-api-behavior.md` |
 | `skill-injection-matrix.spec.ts` | `custom-skill-injection.md` *(早期文件)* |
 | `system-prompt-matrix.spec.ts` | `system-prompt-options.md` *(早期文件)* |
 
@@ -332,6 +333,7 @@ Select-String -Path "test\integration\tmp\**\*.request.json" -Pattern "greet|jok
 | `raw/stream-tool-powershell-behavior.md` | PowerShell 流式工具调用（与 Bash 行为相同、input={command,description}、成功 tool_result 含 {stdout,stderr,interrupted,isImage,noOutputExpected} 结构化对象、失败 tool_result 为错误字符串、固定 5 次 input_json_delta、零 tool_progress、LLM 默认偏好 Bash、需明确要求才使用 PowerShell、Vue3+Element Plus 终端风格渲染方案、与 Bash 使用相同组件） |
 | `raw/session-reuse-methods-behavior.md` | 会话复用方法全景观察（7 组实验），continue/resume/forkSession/单次 query 多轮四种稳定方法性能对比（continue 快 42%、resume 快 53%、forkSession 慢 122%、单次 query 多轮快 45%），V2 session API 弃用分析，bridge/perpetual 实验性 API 风险评估，不同场景应用建议 |
 | `raw/widget-generative-ui-behavior.md` | Widget 生成式 UI LLM 遵循性观察（6 组实验），show-widget 围栏格式遵循性分析（格式不稳定、Chart.js 场景最差、SVG diagram/art 可行、JSON 完整性问题、宽松解析器设计） |
+| `raw/cli-rest-api-behavior.md` | CLI 进程直接通信实验，绕过 SDK 用 `--input-format stream-json` JSON 行协议操纵 CLI 进程，验证了 initialize 握手→user 消息→完整响应的全流程，JSON 协议逆向分析，REST API 转化方案 |
 
 > 每次新增实验文档后，更新本节索引。
 
@@ -367,6 +369,7 @@ Select-String -Path "test\integration\tmp\**\*.request.json" -Pattern "greet|jok
 | `stream-tool-powershell.spec.ts` | PowerShell 流式事件观察（6 cases），含简单/失败/管道三种命令场景、input_json_delta 固定 5 次推送、tool_result 成功/失败双格式对比、零 tool_progress、LLM 工具选择偏好分析、与 Bash 行为对比、SSE 前端视角 |
 | `session-reuse-methods.spec.ts` | 会话复用方法观察（7 cases），含 continue/resume/forkSession/单次 query 多轮对话四种稳定方法对比，V2 session API 弃用分析，bridge/perpetual 实验性 API 风险评估，性能对比（continue 快 42%、resume 快 53%、forkSession 慢 122%、单次 query 多轮快 45%） |
 | `widget-generative-ui.spec.ts` | Widget 生成式 UI LLM 遵循性观察（6 cases），含 show-widget 围栏格式验证、JSON 解析、设计规则合规检查、多 widget 独立围栏测试、宽松 JSON 修复解析器 |
+| `cli-rest-api.spec.ts` | CLI 进程直接通信实验（1 case），绕过 SDK 直接 spawn claude 进程，验证 `--input-format stream-json` JSON 行协议的 initialize 握手和 user 消息通信 |
 
 ## 执行命令
 
