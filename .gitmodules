@@ -1,3 +1,6 @@
 [submodule "repos/CodePilot"]
 	path = repos/CodePilot
 	url = https://github.com/op7418/CodePilot
+[submodule "raw/claude-code-docs"]
+	path = raw/claude-code-docs
+	url = https://github.com/ericbuess/claude-code-docs
