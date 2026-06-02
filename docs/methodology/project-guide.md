@@ -284,6 +284,7 @@ Select-String -Path "test\integration\tmp\**\*.request.json" -Pattern "greet|jok
 | `cli-rest-api.spec.ts` | `cli-rest-api-behavior.md` |
 | `cli-process-pool.spec.ts` | `cli-process-pool-behavior.md` |
 | `sandbox-windows-unsupported.spec.ts` | `sandbox-windows-unsupported-behavior.md` |
+| `sandbox-wsl2-spawn.spec.ts` | `sandbox-wsl2-spawn-behavior.md` |
 | `skill-injection-matrix.spec.ts` | `custom-skill-injection.md` *(早期文件)* |
 | `system-prompt-matrix.spec.ts` | `system-prompt-options.md` *(早期文件)* |
 
@@ -338,6 +339,7 @@ Select-String -Path "test\integration\tmp\**\*.request.json" -Pattern "greet|jok
 | `raw/cli-rest-api-behavior.md` | CLI 进程直接通信实验，绕过 SDK 用 `--input-format stream-json` JSON 行协议操纵 CLI 进程，验证了 initialize 握手→user 消息→完整响应的全流程，JSON 协议逆向分析，REST API 转化方案 |
 | `raw/cli-process-pool-behavior.md` | CLI 多进程池架构验证（3 组实验），进程复用（result 后继续发消息）、多进程并发（两个进程同时运行）、输出流路由（每条消息带 session_id+uuid），N:1:N 架构设计（HTTP 客户端:会话:CLI 进程） |
 | `raw/sandbox-windows-unsupported-behavior.md` | Sandbox Windows 不支持行为观察（6 组实验），sandbox.enabled=true + 默认 failIfUnavailable 在 Windows 上抛异常（不发出 API 请求），failIfUnavailable=false 降级正常运行，sandbox 配置不影响 API 请求结构（tools=23、system=2 均一致），异常通过 throw 而非 result.subtype 传递 |
+| `raw/sandbox-wsl2-spawn-behavior.md` | Sandbox WSL2 Spawn 实验（4 组实验），通过 spawnClaudeCodeProcess 钩子从 Windows 穿透到 WSL2 启动 Linux 版 Claude，sandbox.enabled=true 在 WSL2 中正常工作，环境变量需手动注入到 bash 命令，stdin/stdout JSON 行协议跨 OS 完全兼容 |
 
 > 每次新增实验文档后，更新本节索引。
 
@@ -376,6 +378,7 @@ Select-String -Path "test\integration\tmp\**\*.request.json" -Pattern "greet|jok
 | `cli-rest-api.spec.ts` | CLI 进程直接通信实验（1 case），绕过 SDK 直接 spawn claude 进程，验证 `--input-format stream-json` JSON 行协议的 initialize 握手和 user 消息通信 |
 | `cli-process-pool.spec.ts` | CLI 多进程池验证（3 cases），进程复用（单进程连续两条消息）、多进程并发（两个进程同时收发）、输出流路由（session_id/uuid 标识字段全景分析） |
 | `sandbox-windows-unsupported.spec.ts` | Sandbox Windows 不支持行为观察（6 cases），含基线/enabled 默认/enabled+降级/enabled 显式硬失败/全配置+降级/显式禁用对比，验证 Windows 抛异常机制、failIfUnavailable 默认值、降级运行、请求结构无差异 |
+| `sandbox-wsl2-spawn.spec.ts` | Sandbox WSL2 Spawn 实验（4 cases），含 Windows 对照组/WSL2 基线/WSL2+sandbox.enabled/WSL2+sandbox 全配置，验证 spawnClaudeCodeProcess 钩子从 Windows 穿透 WSL2 启动 Linux 版 Claude + sandbox 生效 |
 
 ## 执行命令
 
