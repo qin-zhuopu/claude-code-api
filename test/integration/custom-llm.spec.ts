@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import dotenv from 'dotenv';
+import { getProfileEnv } from '../llm-profiles';
 
 dotenv.config();
 
@@ -9,15 +10,7 @@ describe('Custom LLM (Jereh Proxy)', () => {
     const sdkQuery = query({
       prompt: 'say hello',
       options: {
-        env: {
-          ANTHROPIC_AUTH_TOKEN: process.env.ANTHROPIC_AUTH_TOKEN_JEREH,
-          ANTHROPIC_BASE_URL: 'http://aiproxy.jereh.cn:4000',
-          ANTHROPIC_DEFAULT_OPUS_MODEL: 'Jereh-qwen3.6-plus',
-          ANTHROPIC_DEFAULT_SONNET_MODEL: 'Jereh-qwen3.6-plus',
-          ANTHROPIC_DEFAULT_HAIKU_MODEL: 'Jereh-qwen3.5-flash',
-          API_TIMEOUT_MS: '3000000',
-          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
-        },
+        env: getProfileEnv('jereh', { includeBehaviorEnv: false }),
         agent: 'simple',
         agents: {
           simple: {

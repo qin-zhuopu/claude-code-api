@@ -19,6 +19,7 @@
 import { describe, it, expect } from 'vitest';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import dotenv from 'dotenv';
+import { getProfileEnv } from '../llm-profiles';
 import { readdirSync, readFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import { createTimestampDir, prettyFormatJsonFiles } from './helpers';
@@ -30,35 +31,11 @@ dotenv.config();
 const ENVIRONMENTS = [
   {
     label: 'Jereh',
-    env: {
-      ANTHROPIC_AUTH_TOKEN: process.env.ANTHROPIC_AUTH_TOKEN_LOCAL,
-      ANTHROPIC_BASE_URL: 'http://10.1.3.115:4000',
-      ANTHROPIC_DEFAULT_OPUS_MODEL: 'Jereh-LLM-NO-THINK-V1',
-      ANTHROPIC_DEFAULT_SONNET_MODEL: 'Jereh-LLM-NO-THINK-V1',
-      ANTHROPIC_DEFAULT_HAIKU_MODEL: 'Jereh-LLM-NO-THINK-V1',
-      API_TIMEOUT_MS: '3000000',
-      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
-      CLAUDE_CODE_ENABLE_TELEMETRY: '1',
-      OTEL_LOGS_EXPORTER: 'none',
-      OTEL_METRICS_EXPORTER: 'none',
-      OTEL_TRACES_EXPORTER: 'none',
-    },
+    env: getProfileEnv('local'),
   },
   {
     label: 'GLM',
-    env: {
-      ANTHROPIC_AUTH_TOKEN: process.env.ANTHROPIC_AUTH_TOKEN_BIGMODEL,
-      ANTHROPIC_BASE_URL: 'https://open.bigmodel.cn/api/anthropic',
-      ANTHROPIC_DEFAULT_OPUS_MODEL: 'glm-4.7',
-      ANTHROPIC_DEFAULT_SONNET_MODEL: 'glm-4.7',
-      ANTHROPIC_DEFAULT_HAIKU_MODEL: 'glm-4.5-air',
-      API_TIMEOUT_MS: '3000000',
-      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
-      CLAUDE_CODE_ENABLE_TELEMETRY: '1',
-      OTEL_LOGS_EXPORTER: 'none',
-      OTEL_METRICS_EXPORTER: 'none',
-      OTEL_TRACES_EXPORTER: 'none',
-    },
+    env: getProfileEnv('bigmodel'),
   },
 ] as const;
 

@@ -30,24 +30,13 @@ import { createTimestampDir } from './helpers';
 import { writeFileSync, mkdirSync, writeFileSync as writeFile } from 'fs';
 import { join } from 'path';
 import dotenv from 'dotenv';
+import { getProfileEnv } from '../llm-profiles';
 
 dotenv.config();
 
 // ====== 公共配置 ======
 
-const BASE_ENV = {
-  ANTHROPIC_AUTH_TOKEN: process.env.ANTHROPIC_AUTH_TOKEN_LOCAL,
-  ANTHROPIC_BASE_URL: 'http://10.1.3.115:4000',
-  ANTHROPIC_DEFAULT_OPUS_MODEL: 'Jereh-LLM-NO-THINK-V1',
-  ANTHROPIC_DEFAULT_SONNET_MODEL: 'Jereh-LLM-NO-THINK-V1',
-  ANTHROPIC_DEFAULT_HAIKU_MODEL: 'Jereh-LLM-NO-THINK-V1',
-  API_TIMEOUT_MS: '3000000',
-  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
-  CLAUDE_CODE_ENABLE_TELEMETRY: '1',
-  OTEL_LOGS_EXPORTER: 'none',
-  OTEL_METRICS_EXPORTER: 'none',
-  OTEL_TRACES_EXPORTER: 'none',
-};
+const BASE_ENV = getProfileEnv('local');
 
 // ====== 事件收集工具 ======
 

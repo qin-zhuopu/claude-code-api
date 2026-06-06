@@ -2,6 +2,7 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { INestApplication, ValidationPipe } from '@nestjs/common';
 import { AppModule } from './../../src/app.module';
 import dotenv from 'dotenv';
+import { getProfileEnv, ProfileName } from '../llm-profiles';
 import fs from 'fs';
 import path from 'path';
 
@@ -42,12 +43,7 @@ describe('Simple Query Demo (简单查询)', () => {
       body: JSON.stringify({
         prompt: 'What is 2+2? Answer in one short sentence.',
         options: {
-          env: {
-            ANTHROPIC_AUTH_TOKEN: process.env.ANTHROPIC_AUTH_TOKEN,
-            ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL,
-            API_TIMEOUT_MS: process.env.API_TIMEOUT_MS,
-            CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC,
-          }
+          env: getProfileEnv((process.env.LLM_PROFILE as ProfileName) || 'bigmodel', { includeBehaviorEnv: false, includeModelNames: false }),
         }
       }),
     });
