@@ -26,7 +26,7 @@ dotenv.config();
 // ====== 公共配置 ======
 
 const QUERY_OPTIONS = {
-  env: getProfileEnv('bigmodel', { includeBehaviorEnv: false }),
+  env: getProfileEnv('bigmodel', { includeBehaviorEnv: false, includeModelNames: false }),
   agent: 'simple',
   agents: {
     simple: {

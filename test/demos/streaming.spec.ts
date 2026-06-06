@@ -2,7 +2,7 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { INestApplication, ValidationPipe } from '@nestjs/common';
 import { AppModule } from './../../src/app.module';
 import dotenv from 'dotenv';
-import { getProfileEnv } from '../llm-profiles';
+import { getProfileEnv, ProfileName } from '../llm-profiles';
 import fs from 'fs';
 import path from 'path';
 
@@ -68,7 +68,7 @@ describe('Streaming Demo (实时流式输出)', () => {
       body: JSON.stringify({
         prompt,
         options: {
-          env: getProfileEnv('bigmodel', { includeBehaviorEnv: false }),
+          env: getProfileEnv((process.env.LLM_PROFILE as ProfileName) || 'bigmodel', { includeBehaviorEnv: false, includeModelNames: false }),
           tools: [],
           skills: [],
         },

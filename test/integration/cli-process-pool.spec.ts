@@ -23,7 +23,7 @@ function sendJson(proc: ChildProcess, msg: object) {
 function spawnCliProcess(label: string): ChildProcess {
   const env = {
     ...process.env,
-    ...getProfileEnv('bigmodel', { includeBehaviorEnv: false }),
+    ...getProfileEnv('bigmodel', { includeBehaviorEnv: false, includeModelNames: false }),
     CLAUDE_CODE_ENTRYPOINT: 'cli-pool-experiment',
   };
 

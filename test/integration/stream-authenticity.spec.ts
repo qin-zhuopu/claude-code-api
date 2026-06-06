@@ -44,7 +44,7 @@ describe('Stream Authenticity', () => {
       body: JSON.stringify({
         prompt: '用三句话介绍太阳系',
         options: {
-          env: getProfileEnv('bigmodel', { includeBehaviorEnv: false }),
+          env: getProfileEnv('bigmodel', { includeBehaviorEnv: false, includeModelNames: false }),
           agent: 'simple',
           agents: {
             simple: {

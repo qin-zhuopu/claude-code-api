@@ -101,7 +101,7 @@ describe('Query API (e2e)', () => {
         body: JSON.stringify({
           prompt,
           options: {
-            env: getProfileEnv('bigmodel', { includeBehaviorEnv: false }),
+            env: getProfileEnv('bigmodel', { includeBehaviorEnv: false, includeModelNames: false }),
             agent: 'simple',
             agents: {
               simple: {

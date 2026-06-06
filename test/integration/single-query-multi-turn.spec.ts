@@ -26,7 +26,7 @@ describe('Single Query Multi-Turn Streaming', () => {
     const sdkQuery = query({
       prompt: conversation(),
       options: {
-        env: getProfileEnv('bigmodel', { includeBehaviorEnv: false }),
+        env: getProfileEnv('bigmodel', { includeBehaviorEnv: false, includeModelNames: false }),
         agent: 'simple',
         agents: {
           simple: {

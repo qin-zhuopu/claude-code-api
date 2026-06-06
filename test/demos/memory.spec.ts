@@ -2,7 +2,7 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { INestApplication, ValidationPipe } from '@nestjs/common';
 import { AppModule } from './../../src/app.module';
 import dotenv from 'dotenv';
-import { getProfileEnv } from '../llm-profiles';
+import { getProfileEnv, ProfileName } from '../llm-profiles';
 import fs from 'fs';
 import path from 'path';
 
@@ -94,7 +94,7 @@ describe('Memory Demo (对话记忆)', () => {
   }
 
   it('应该记住对话上下文，知道用户是小明', async () => {
-    const envConfig = getProfileEnv('bigmodel', { includeBehaviorEnv: false });
+    const envConfig = getProfileEnv((process.env.LLM_PROFILE as ProfileName) || 'bigmodel', { includeBehaviorEnv: false, includeModelNames: false });
 
     console.log('\n========== Memory Demo ==========');
     console.log('第一轮：告诉 AI "我是小明"');

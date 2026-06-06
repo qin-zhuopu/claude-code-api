@@ -8,7 +8,7 @@ import { getProfileEnv } from '../llm-profiles';
 dotenv.config();
 
 const queryOptions = {
-  env: getProfileEnv('bigmodel', { includeBehaviorEnv: false }),
+  env: getProfileEnv('bigmodel', { includeBehaviorEnv: false, includeModelNames: false }),
   agent: 'simple',
   agents: {
     simple: {

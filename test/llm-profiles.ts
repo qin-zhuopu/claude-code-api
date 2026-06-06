@@ -80,25 +80,34 @@ export function getProfileEnv(
   profileName: ProfileName,
   options?: {
     includeBehaviorEnv?: boolean;
+    includeModelNames?: boolean;
     overrides?: Record<string, string | undefined>;
   },
 ): Record<string, string | undefined> {
   const profile = PROFILES[profileName];
   const includeBehaviorEnv = options?.includeBehaviorEnv ?? true;
+  const includeModelNames = options?.includeModelNames ?? true;
 
   const token =
     profile.tokenEnvVar !== null
       ? process.env[profile.tokenEnvVar]
       : profile.hardcodedToken;
 
+  if (profile.tokenEnvVar !== null && token === undefined) {
+    console.warn(`[llm-profiles] WARNING: Environment variable '${profile.tokenEnvVar}' is not set. Tests using profile '${profileName}' will likely fail.`);
+  }
+
   const env: Record<string, string | undefined> = {
     ANTHROPIC_AUTH_TOKEN: token,
     ANTHROPIC_BASE_URL: profile.baseUrl,
-    ANTHROPIC_DEFAULT_OPUS_MODEL: profile.opusModel,
-    ANTHROPIC_DEFAULT_SONNET_MODEL: profile.sonnetModel,
-    ANTHROPIC_DEFAULT_HAIKU_MODEL: profile.haikuModel,
     API_TIMEOUT_MS: profile.apiTimeout,
   };
+
+  if (includeModelNames) {
+    env.ANTHROPIC_DEFAULT_OPUS_MODEL = profile.opusModel;
+    env.ANTHROPIC_DEFAULT_SONNET_MODEL = profile.sonnetModel;
+    env.ANTHROPIC_DEFAULT_HAIKU_MODEL = profile.haikuModel;
+  }
 
   if (includeBehaviorEnv) {
     Object.assign(env, COMMON_BEHAVIOR_ENV);

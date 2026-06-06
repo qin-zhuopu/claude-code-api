@@ -94,7 +94,7 @@ function collectUntil(
 function spawnCliProcess(): ChildProcess {
   const env = {
     ...process.env,
-    ...getProfileEnv('bigmodel', { includeBehaviorEnv: false }),
+    ...getProfileEnv('bigmodel', { includeBehaviorEnv: false, includeModelNames: false }),
     CLAUDE_CODE_ENTRYPOINT: 'cli-rest-api-experiment',
   };
 
