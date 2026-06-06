@@ -4,7 +4,7 @@ import dotenv from 'dotenv';
 import { readdirSync, readFileSync, existsSync } from 'fs';
 import { join, resolve } from 'path';
 import { createTimestampDir, prettyFormatJsonFiles } from './helpers';
-import { getProfileEnv } from './llm-profiles';
+import { getProfileEnv } from '../llm-profiles';
 
 dotenv.config();
 

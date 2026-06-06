@@ -21,7 +21,7 @@
 import { describe, it, expect } from 'vitest';
 import { query, HookCallback, PreToolUseHookInput } from '@anthropic-ai/claude-agent-sdk';
 import dotenv from 'dotenv';
-import { getProfileEnv } from './llm-profiles';
+import { getProfileEnv } from '../llm-profiles';
 import { resolve } from 'path';
 import { createTimestampDir, prettyFormatJsonFiles } from './helpers';
 

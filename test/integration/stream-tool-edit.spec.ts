@@ -30,7 +30,7 @@ import { createTimestampDir } from './helpers';
 import { writeFileSync, mkdirSync, writeFileSync as writeFile } from 'fs';
 import { join } from 'path';
 import dotenv from 'dotenv';
-import { getProfileEnv } from './llm-profiles';
+import { getProfileEnv } from '../llm-profiles';
 
 dotenv.config();
 

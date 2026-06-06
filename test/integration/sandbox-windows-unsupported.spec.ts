@@ -26,7 +26,7 @@
 import { describe, it, expect } from 'vitest';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import dotenv from 'dotenv';
-import { getProfileEnv } from './llm-profiles';
+import { getProfileEnv } from '../llm-profiles';
 import { readdirSync, readFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import { createTimestampDir, prettyFormatJsonFiles } from './helpers';

@@ -10,7 +10,7 @@ import { describe, it, expect } from 'vitest';
 import { spawn, ChildProcess } from 'child_process';
 import { createInterface } from 'readline';
 import dotenv from 'dotenv';
-import { getProfileEnv } from './llm-profiles';
+import { getProfileEnv } from '../llm-profiles';
 dotenv.config();
 
 // ===== 辅助函数 =====

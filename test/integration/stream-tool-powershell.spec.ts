@@ -29,7 +29,7 @@ import { AppModule } from '../../src/app.module';
 import { createTimestampDir } from './helpers';
 import { writeFileSync } from 'fs';
 import dotenv from 'dotenv';
-import { getProfileEnv } from './llm-profiles';
+import { getProfileEnv } from '../llm-profiles';
 
 dotenv.config();
 
