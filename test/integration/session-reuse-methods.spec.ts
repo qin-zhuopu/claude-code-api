@@ -4,6 +4,7 @@ import { createTimestampDir, prettyFormatJsonFiles } from './helpers';
 import { existsSync, readFileSync, readdirSync, existsSync as fsExistsSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import dotenv from 'dotenv';
+import { getProfileEnv } from './llm-profiles';
 dotenv.config();
 
 interface SdkEvent {
@@ -12,16 +13,7 @@ interface SdkEvent {
   raw: any;
 }
 
-const BASE_ENV = {
-  ANTHROPIC_AUTH_TOKEN: process.env.ANTHROPIC_AUTH_TOKEN_BIGMODEL,
-  ANTHROPIC_BASE_URL: 'https://open.bigmodel.cn/api/anthropic',
-  API_TIMEOUT_MS: '3000000',
-  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
-  CLAUDE_CODE_ENABLE_TELEMETRY: '1',
-  OTEL_LOGS_EXPORTER: 'none',
-  OTEL_METRICS_EXPORTER: 'none',
-  OTEL_TRACES_EXPORTER: 'none',
-};
+const BASE_ENV = getProfileEnv('bigmodel');
 
 // 运行 query 并收集事件和耗时
 async function runQueryWithMetrics(params: {

@@ -3,6 +3,7 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { INestApplication, ValidationPipe } from '@nestjs/common';
 import { AppModule } from '../../src/app.module';
 import dotenv from 'dotenv';
+import { getProfileEnv } from './llm-profiles';
 
 dotenv.config();
 
@@ -43,12 +44,7 @@ describe('Stream Authenticity', () => {
       body: JSON.stringify({
         prompt: '用三句话介绍太阳系',
         options: {
-          env: {
-            ANTHROPIC_AUTH_TOKEN: process.env.ANTHROPIC_AUTH_TOKEN_BIGMODEL,
-            ANTHROPIC_BASE_URL: 'https://open.bigmodel.cn/api/anthropic',
-            API_TIMEOUT_MS: '3000000',
-            CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
-          },
+          env: getProfileEnv('bigmodel', { includeBehaviorEnv: false }),
           agent: 'simple',
           agents: {
             simple: {

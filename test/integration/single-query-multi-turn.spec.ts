@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import dotenv from 'dotenv';
+import { getProfileEnv } from './llm-profiles';
 dotenv.config();
 
 interface SdkEvent {
@@ -25,12 +26,7 @@ describe('Single Query Multi-Turn Streaming', () => {
     const sdkQuery = query({
       prompt: conversation(),
       options: {
-        env: {
-          ANTHROPIC_AUTH_TOKEN: process.env.ANTHROPIC_AUTH_TOKEN_BIGMODEL,
-          ANTHROPIC_BASE_URL: 'https://open.bigmodel.cn/api/anthropic',
-          API_TIMEOUT_MS: '3000000',
-          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
-        },
+        env: getProfileEnv('bigmodel', { includeBehaviorEnv: false }),
         agent: 'simple',
         agents: {
           simple: {

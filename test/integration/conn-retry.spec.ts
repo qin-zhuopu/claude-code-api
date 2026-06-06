@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import { createTimestampDir, prettyFormatJsonFiles } from './helpers';
 import dotenv from 'dotenv';
+import { getProfileEnv } from './llm-profiles';
 
 dotenv.config();
 
@@ -33,33 +34,13 @@ dotenv.config();
  */
 
 // 基础环境变量 — 指向一个不存在的端点以触发连接失败
-const UNREACHABLE_ENV = {
-  ANTHROPIC_AUTH_TOKEN: 'fake-token-for-retry-test',
-  ANTHROPIC_BASE_URL: 'http://192.0.2.1:1', // RFC 5737 TEST-NET, 不可达
-  ANTHROPIC_DEFAULT_OPUS_MODEL: 'test-model',
-  ANTHROPIC_DEFAULT_SONNET_MODEL: 'test-model',
-  ANTHROPIC_DEFAULT_HAIKU_MODEL: 'test-model',
-  API_TIMEOUT_MS: '5000', // 5 秒超时，加速测试
-  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
-  CLAUDE_CODE_ENABLE_TELEMETRY: '1',
-  OTEL_LOGS_EXPORTER: 'none',
-  OTEL_METRICS_EXPORTER: 'none',
-  OTEL_TRACES_EXPORTER: 'none',
-};
+const UNREACHABLE_ENV = getProfileEnv('conn-retry-unreachable');
 
 // 指向一个会立即拒绝连接的端口（localhost 未监听端口）
-const CONN_REFUSED_ENV = {
-  ...UNREACHABLE_ENV,
-  ANTHROPIC_BASE_URL: 'http://127.0.0.1:19999', // 大概率无人监听
-  API_TIMEOUT_MS: '5000',
-};
+const CONN_REFUSED_ENV = getProfileEnv('conn-retry-refused');
 
 // 指向一个会返回 500 错误的端点（如果有 mock server 可用）
-const SERVER_ERROR_ENV = {
-  ...UNREACHABLE_ENV,
-  ANTHROPIC_BASE_URL: 'http://127.0.0.1:19998', // 需要 mock server
-  API_TIMEOUT_MS: '10000',
-};
+const SERVER_ERROR_ENV = getProfileEnv('conn-retry-server-error');
 
 interface RetryEvent {
   attempt: number;

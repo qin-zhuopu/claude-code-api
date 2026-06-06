@@ -10,6 +10,7 @@ import { describe, it, expect } from 'vitest';
 import { spawn, ChildProcess } from 'child_process';
 import { createInterface } from 'readline';
 import dotenv from 'dotenv';
+import { getProfileEnv } from './llm-profiles';
 dotenv.config();
 
 // ===== 辅助函数 =====
@@ -22,10 +23,7 @@ function sendJson(proc: ChildProcess, msg: object) {
 function spawnCliProcess(label: string): ChildProcess {
   const env = {
     ...process.env,
-    ANTHROPIC_AUTH_TOKEN: process.env.ANTHROPIC_AUTH_TOKEN_BIGMODEL,
-    ANTHROPIC_BASE_URL: 'https://open.bigmodel.cn/api/anthropic',
-    API_TIMEOUT_MS: '3000000',
-    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+    ...getProfileEnv('bigmodel', { includeBehaviorEnv: false }),
     CLAUDE_CODE_ENTRYPOINT: 'cli-pool-experiment',
   };
 

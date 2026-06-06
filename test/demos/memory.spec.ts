@@ -2,6 +2,7 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { INestApplication, ValidationPipe } from '@nestjs/common';
 import { AppModule } from './../../src/app.module';
 import dotenv from 'dotenv';
+import { getProfileEnv } from '../llm-profiles';
 import fs from 'fs';
 import path from 'path';
 
@@ -93,12 +94,7 @@ describe('Memory Demo (对话记忆)', () => {
   }
 
   it('应该记住对话上下文，知道用户是小明', async () => {
-    const envConfig = {
-      ANTHROPIC_AUTH_TOKEN: process.env.ANTHROPIC_AUTH_TOKEN,
-      ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL,
-      API_TIMEOUT_MS: process.env.API_TIMEOUT_MS,
-      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC,
-    };
+    const envConfig = getProfileEnv('bigmodel', { includeBehaviorEnv: false });
 
     console.log('\n========== Memory Demo ==========');
     console.log('第一轮：告诉 AI "我是小明"');
