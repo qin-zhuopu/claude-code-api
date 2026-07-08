@@ -353,6 +353,8 @@ Select-String -Path "test\integration\tmp\**\*.request.json" -Pattern "greet|jok
 | `raw/workflow-lifecycle-behavior.md` | Workflow 生命周期消息观测（4 组实验），session_state_changed 不可达分析、task_started/task_progress/task_notification/task_updated 可通过 query() 获取、task_notification 完整结构（含 usage + output_file）、BackgroundTaskSummary 类型存在但无查询 API、Workflow 总是异步后台运行、SDK 与 CLI 独立发版机制 |
 | `raw/claude-code-full-tools-list.md` | Claude Code 全量工具列表（42 个工具），权限要求分类、执行模式分类、权限规则格式、新增工具清单、SDK/CLI 版本关系 |
 | `raw/env-group-config.md` | Env 配置组加载机制（JEREH__/ANTHROPIC__ 前缀解析）、loadEnvGroup()/loadEnvGroupWithDefaults() 用法、多环境切换方案 |
+| `raw/workflow-webui-design.md` | Workflow Web UI 设计方案（V2）— 聊天窗口为核心、后台任务面板为辅助，含 task_* 事件到 UI 的映射、任务级控制协议、SSE 事件流规范 |
+| `raw/workflow-webui-user-journey.md` | Workflow Web UI 用户旅程 — 从打开页面到完成（6 阶段），每个阶段的用户视角、可能问题、操作选择、异常处理、完整时间线示例 |
 
 > 每次新增实验文档后，更新本节索引。
 
