@@ -289,6 +289,8 @@ Select-String -Path "test\integration\tmp\**\*.request.json" -Pattern "greet|jok
 | `session-fork-uptomessage.spec.ts` | `session-fork-uptomessage-behavior.md` |
 | `workflow-tool-mechanism.spec.ts` | `workflow-tool-mechanism-behavior.md` |
 | `tool-foreground-background.spec.ts` | `tool-foreground-background-behavior.md` |
+| `sprint-workflow-e2e.spec.ts` | `workflow-lifecycle-behavior.md` |
+| `session-state-lifecycle.spec.ts` | `workflow-lifecycle-behavior.md` |
 | `skill-injection-matrix.spec.ts` | `custom-skill-injection.md` *(早期文件)* |
 | `system-prompt-matrix.spec.ts` | `system-prompt-options.md` *(早期文件)* |
 
@@ -348,6 +350,9 @@ Select-String -Path "test\integration\tmp\**\*.request.json" -Pattern "greet|jok
 | `raw/session-fork-uptomessage-behavior.md` | Session Fork upToMessageId/resumeSessionAt 观察性测试（7 组实验），两条路径截断后 messages 结构完全一致（B=6,A=6），inclusive 语义确认（截断点 message 保留），截断层级递增（每轮+2），省略 upToMessageId=完整拷贝，resumeSessionAt 只接受 assistant UUID、forkSession()+upToMessageId 可接受任意 UUID |
 | `raw/workflow-tool-mechanism-behavior.md` | Workflow 工具机制观察（12 组实验），input_schema 7 参数结构、disableWorkflows 通过 settings 传入、tools=[] 清空效果、subagent 请求中 Workflow 不可见、description 18997 字符、args 无 type 约束 |
 | `raw/tool-foreground-background-behavior.md` | 前台/后台工具机制观察（9 组实验），Bash/Agent/Workflow 前后台行为对比、task_started/task_notification 完整字段结构、task_type 映射（local_bash/local_agent/local_workflow）、run_in_background 参数传递规则、CLAUDE_CODE_DISABLE_BACKGROUND_TASKS 效果验证 |
+| `raw/workflow-lifecycle-behavior.md` | Workflow 生命周期消息观测（4 组实验），session_state_changed 不可达分析、task_started/task_progress/task_notification/task_updated 可通过 query() 获取、task_notification 完整结构（含 usage + output_file）、BackgroundTaskSummary 类型存在但无查询 API、Workflow 总是异步后台运行、SDK 与 CLI 独立发版机制 |
+| `raw/claude-code-full-tools-list.md` | Claude Code 全量工具列表（42 个工具），权限要求分类、执行模式分类、权限规则格式、新增工具清单、SDK/CLI 版本关系 |
+| `raw/env-group-config.md` | Env 配置组加载机制（JEREH__/ANTHROPIC__ 前缀解析）、loadEnvGroup()/loadEnvGroupWithDefaults() 用法、多环境切换方案 |
 
 > 每次新增实验文档后，更新本节索引。
 
@@ -389,6 +394,8 @@ Select-String -Path "test\integration\tmp\**\*.request.json" -Pattern "greet|jok
 | `sandbox-wsl2-spawn.spec.ts` | Sandbox WSL2 Spawn 实验（4 cases），含 Windows 对照组/WSL2 基线/WSL2+sandbox.enabled/WSL2+sandbox 全配置，验证 spawnClaudeCodeProcess 钩子从 Windows 穿透 WSL2 启动 Linux 版 Claude + sandbox 生效 |
 | `sdk-custom-tool.spec.ts` | SDK Custom Tool 观察（5 cases），含基线/注册+调用/tools=[]+annotations/注册不用，验证 tool()+createSdkMcpServer() 自定义 tool 在 API 请求中的命名、input_schema、annotations 是否传递、handler 进程内执行 |
 | `session-fork-uptomessage.spec.ts` | Session Fork upToMessageId/resumeSessionAt 观察性测试（7 cases），含基线(2轮历史+UUID收集)/路径B round-1截断/路径B round-2截断/路径A round-1截断/路径A round-2截断/路径B↔A对比/完整拷贝边界，验证两条路径截断后 messages 结构完全一致、inclusive 语义、截断层级递增规律 |
+| `sprint-workflow-e2e.spec.ts` | Sprint Workflow 端到端测试（2 cases），含前台/后台两种模式，验证 Workflow 工具被调用、内部 Agent 串行执行、OTEL 日志完整记录、task_started/task_notification 事件可达 |
+| `session-state-lifecycle.spec.ts` | Workflow 生命周期消息观测（2 cases），验证 session_state_changed 不在 query() yield 中、task_started/task_progress/task_notification 可达、output_file 读取 workflow 结构化结果 |
 
 ## 执行命令
 
