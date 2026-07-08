@@ -287,6 +287,8 @@ Select-String -Path "test\integration\tmp\**\*.request.json" -Pattern "greet|jok
 | `sandbox-wsl2-spawn.spec.ts` | `sandbox-wsl2-spawn-behavior.md` |
 | `sdk-custom-tool.spec.ts` | `sdk-custom-tool-behavior.md` |
 | `session-fork-uptomessage.spec.ts` | `session-fork-uptomessage-behavior.md` |
+| `workflow-tool-mechanism.spec.ts` | `workflow-tool-mechanism-behavior.md` |
+| `tool-foreground-background.spec.ts` | `tool-foreground-background-behavior.md` |
 | `skill-injection-matrix.spec.ts` | `custom-skill-injection.md` *(早期文件)* |
 | `system-prompt-matrix.spec.ts` | `system-prompt-options.md` *(早期文件)* |
 
@@ -344,6 +346,8 @@ Select-String -Path "test\integration\tmp\**\*.request.json" -Pattern "greet|jok
 | `raw/sandbox-wsl2-spawn-behavior.md` | Sandbox WSL2 Spawn 实验（4 组实验），通过 spawnClaudeCodeProcess 钩子从 Windows 穿透到 WSL2 启动 Linux 版 Claude，sandbox.enabled=true 在 WSL2 中正常工作，环境变量需手动注入到 bash 命令，stdin/stdout JSON 行协议跨 OS 完全兼容 |
 | `raw/sdk-custom-tool-behavior.md` | SDK Custom Tool 观察性测试（5 组实验），tool()+createSdkMcpServer() 注册自定义 tool 后以 mcp__{server}__{tool} 格式追加到 tools 列表，tools=[] 精确清除内置 tool 只剩自定义 tool，annotations 不出现在 API 请求中，handler 进程内执行 |
 | `raw/session-fork-uptomessage-behavior.md` | Session Fork upToMessageId/resumeSessionAt 观察性测试（7 组实验），两条路径截断后 messages 结构完全一致（B=6,A=6），inclusive 语义确认（截断点 message 保留），截断层级递增（每轮+2），省略 upToMessageId=完整拷贝，resumeSessionAt 只接受 assistant UUID、forkSession()+upToMessageId 可接受任意 UUID |
+| `raw/workflow-tool-mechanism-behavior.md` | Workflow 工具机制观察（12 组实验），input_schema 7 参数结构、disableWorkflows 通过 settings 传入、tools=[] 清空效果、subagent 请求中 Workflow 不可见、description 18997 字符、args 无 type 约束 |
+| `raw/tool-foreground-background-behavior.md` | 前台/后台工具机制观察（9 组实验），Bash/Agent/Workflow 前后台行为对比、task_started/task_notification 完整字段结构、task_type 映射（local_bash/local_agent/local_workflow）、run_in_background 参数传递规则、CLAUDE_CODE_DISABLE_BACKGROUND_TASKS 效果验证 |
 
 > 每次新增实验文档后，更新本节索引。
 
