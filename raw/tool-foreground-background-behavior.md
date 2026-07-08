@@ -2,7 +2,7 @@
 
 > 调研人：Claude Code  
 > 日期：2026-07-08  
-> 状态：已完成初步实验（9/11 cases 完成，2 cases 需补充）
+> 状态：已完成全部实验（11/11 cases 完成）
 
 ---
 
@@ -37,9 +37,9 @@
 | 6 | Workflow 工具 | ✅ 完成 | task_type=`local_workflow`；task_started 含 `workflow_name`；notification 含 `usage` |
 | 7 | `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` | ✅ 完成 | LLM 仍设 `run_in_background: true`；task 仍启动；status=`stopped` |
 | 8 | PowerShell 前台运行基线 | ✅ 完成 | 与 Bash 行为一致；task_type=`local_bash` |
-| 9 | SSE: Bash 前台 | ❌ 未运行 | — |
-| 10 | SSE: Agent 后台 | ❌ 未运行 | — |
-| 11 | SSE: Read 瞬时 | ❌ 未运行 | — |
+| 9 | SSE: Bash 前台 | ✅ 完成 | SSE 包装格式确认；前台 Bash 无 task 消息 |
+| 10 | SSE: Agent 后台 | ✅ 完成 | SSE 中 system→task_started/task_notification 正确传输 |
+| 11 | SSE: Read 瞬时 | ✅ 完成 | SSE 中无 task 消息（Read 瞬时工具） |
 
 ---
 
@@ -242,7 +242,24 @@ Command running in background with ID: bgouhkf54. Output is being written to: C:
 - ✅ **task_notification 完成时含 `usage`** — 含 total_tokens/tool_uses/duration_ms
 - ✅ 有 `task_progress` 消息推送（2-3 次）
 
-### 6. CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1（Case 7）
+### 10. SSE 传输验证（Cases 9-11）
+
+**Case 9: SSE Bash 前台**
+- ✅ 前台 Bash 在 SSE 中**不产生** task_started/task_notification 消息
+- ✅ system 消息仅含 `init`、`status`（含 tools 列表、session_id、claude_code_version 等）
+- ✅ assistant tool_use input 通过 SSE 完整传输：`{command, description}`（无 run_in_background）
+- ✅ user tool_result content 为 string 类型，直接包含 stdout 内容
+
+**Case 10: SSE Agent 后台**
+- ✅ SSE 中 system→task_started/task_notification 正确传输
+- ✅ task_started 含 task_id、task_type=local_agent
+- ✅ task_notification 含 status、summary、output_file
+
+**Case 11: SSE Read 瞬时**
+- ✅ SSE 中无 task_started/task_notification 消息（Read 为瞬时工具）
+- ✅ 验证了 SSE 传输与直接 SDK 调用的一致性
+
+### 11. `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`（Case 7）
 
 **关键发现**：
 - ⚠️ **LLM 仍然设置了 `run_in_background: true`** — 环境变量不影响 LLM 的指令遵循
@@ -260,13 +277,31 @@ Command running in background with ID: bgouhkf54. Output is being written to: C:
 
 **结论**：`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` 可能仅在 TUI 中禁用 Ctrl+B 快捷键，不影响 API 层面的 `run_in_background` 参数。LLM 仍可将命令发送到后台，但最终状态会被标记为 `stopped`。
 
-### 7. PowerShell 前台运行（Case 8）
+### 8. PowerShell 前台运行（Case 8）
 
 **关键观察**：
 - ✅ PowerShell 前台行为与 Bash 一致 — 无 task 消息（当 `run_in_background` 未设置时）
 - ✅ LLM 尝试先用 Bash 执行 PowerShell 命令后回退到 PowerShell 工具
 
-### 8. task_started 完整结构
+### 9. SSE 传输验证（Cases 9-11）
+
+**Case 9: SSE Bash 前台**
+- ✅ 前台 Bash 在 SSE 中**不产生** task_started/task_notification 消息
+- ✅ system 消息仅含 `init`、`status` — 无 task 相关 subtype
+- ✅ assistant tool_use input 通过 SSE 完整传输：`{command, description}`（无 run_in_background）
+- ✅ user tool_result content 为 string 类型，直接包含 stdout 内容
+
+**Case 10: SSE Agent 后台**
+- ✅ SSE 中 system→task_started/task_notification 正确传输
+- ✅ task_started 含 task_id、task_type=local_agent
+- ✅ task_notification 含 status、summary、output_file
+- ✅ SSE 包装层（serverWrap）正确嵌套 SDK 消息
+
+**Case 11: SSE Read 瞬时**
+- ✅ SSE 中无 task_started/task_notification 消息（Read 为瞬时工具）
+- ✅ 验证了 SSE 传输与直接 SDK 调用的一致性
+
+### 10. task_started 完整结构
 
 | 字段 | Bash | Agent | Workflow |
 |------|------|-------|----------|
@@ -282,7 +317,7 @@ Command running in background with ID: bgouhkf54. Output is being written to: C:
 | prompt | ❌ | ✅ | ✅ |
 | workflow_name | ❌ | ❌ | ✅ |
 
-### 9. task_notification 完整结构
+### 11. task_notification 完整结构
 
 | 字段 | 完成时 | 失败时 | stopped 时 |
 |------|--------|--------|------------|
