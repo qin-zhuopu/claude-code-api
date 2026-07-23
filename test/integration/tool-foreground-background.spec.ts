@@ -25,22 +25,29 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { INestApplication, ValidationPipe } from '@nestjs/common';
 import { AppModule } from '../../src/app.module';
 import { createTimestampDir } from './helpers';
-import { writeFileSync } from 'fs';
+import { writeFileSync, readFileSync } from 'fs';
 import dotenv from 'dotenv';
 
 dotenv.config();
 
 // ====== 公共配置 ======
 
+// 本地 LLM 配置（Jereh litellm 网关 + Kimi-K2.6）。
+// token 走环境变量，不入库；运行前 export ANTHROPIC_AUTH_TOKEN_LOCAL=sk-...
+// 如需切换模型/网关，改这里一处即可；case 内引用 BASE_ENV。
 const BASE_ENV = {
   ANTHROPIC_AUTH_TOKEN: process.env.ANTHROPIC_AUTH_TOKEN_LOCAL,
-  ANTHROPIC_BASE_URL: 'http://10.1.3.115:4000',
-  ANTHROPIC_DEFAULT_OPUS_MODEL: 'Jereh-LLM-NO-THINK-V1',
-  ANTHROPIC_DEFAULT_SONNET_MODEL: 'Jereh-LLM-NO-THINK-V1',
-  ANTHROPIC_DEFAULT_HAIKU_MODEL: 'Jereh-LLM-NO-THINK-V1',
-  API_TIMEOUT_MS: '3000000',
+  ANTHROPIC_BASE_URL: 'https://litellm.jereh.cn',
+  ANTHROPIC_MODEL: 'Jereh-Kimi-K2.6',
+  CLAUDE_CODE_SUBAGENT_MODEL: 'Jereh-Kimi-K2.6',
+  ANTHROPIC_DEFAULT_OPUS_MODEL: 'Jereh-Kimi-K2.6',
+  ANTHROPIC_DEFAULT_SONNET_MODEL: 'Jereh-Kimi-K2.6',
+  ANTHROPIC_DEFAULT_HAIKU_MODEL: 'Jereh-Kimi-K2.6',
+  CLAUDE_CODE_WORKFLOWS: '1',
+  CLAUDE_CODE_USE_POWERSHELL_TOOL: '1',
   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
   CLAUDE_CODE_ENABLE_TELEMETRY: '1',
+  API_TIMEOUT_MS: '3000000',
   OTEL_LOGS_EXPORTER: 'none',
   OTEL_METRICS_EXPORTER: 'none',
   OTEL_TRACES_EXPORTER: 'none',
@@ -1161,4 +1168,317 @@ describe('前台/后台工具 SSE 分析', () => {
 
     expect(events.length).toBeGreaterThan(0);
   }, 120000);
+});
+
+// ====== backgroundTasks() 前台转后台专项实验 ======
+//
+// 这是 docs/handoffs/foreground-background-tools.md 与
+// raw/tool-foreground-background-behavior.md 标注的最大未验证项：
+// 「在 query 运行期间调用 backgroundTasks(toolUseId) 把一个前台阻塞中的
+//   工具调用转为后台，其实际效果未验证」。
+//
+// 实验设计（控制变量）：
+//   Case 12（基线）: 前台跑长 sleep，不调用 backgroundTasks()。
+//                    预期：tool_result 在命令跑完后才返回（阻塞整个 query），
+//                    全程无 task_started / task_notification。
+//   Case 13（核心）: 前台跑同样的长 sleep，但在检测到 Bash tool_use 启动后
+//                    立即调用 query.backgroundTasks(toolUseId)。
+//                    预期：
+//                      a. tool_result 几乎立刻返回（不再阻塞），含 backgroundTaskId
+//                      b. 收到 task_started（task_id == backgroundTaskId，task_type=local_bash）
+//                      c. 拼出的 output 文件路径可在任务结束后 Read 到 sleep 后的 echo 输出
+//                      d. 收到 task_notification（status=completed 或 stopped）
+//
+// 关键技术点：query() 返回的对象既是 async iterable，又带有控制方法
+// (backgroundTasks / stopTask / close)。我们保留对该对象的引用，
+// 在 for await 循环内、检测到 Bash tool_use 后调用它。
+
+describe('backgroundTasks() 前台转后台机制', () => {
+  // 长命令：跑 ~40s，给后台化触发留足时间窗。
+  // 第一轮实验发现 SDK 自身也会在 ~30s 处把长前台 Bash 自动后台化，
+  // 因此 sleep 取 40s，确保无论是「我们主动转」还是「SDK 自动转」都落在命令执行期内。
+  const LONG_CMD = 'sleep 40 && echo bg-conversion-done';
+
+  /**
+   * Case 12: 基线 — 前台跑长命令（不调用 backgroundTasks）
+   *
+   * 设计意图：与 case-13 对照，验证「自动后台化」是否由 backgroundTasks() 触发。
+   *
+   * 关键发现（推翻旧假设）：
+   *   旧 case-1（短命令 echo）显示前台 Bash 无 task 消息。
+   *   但长前台 Bash（sleep 40，LLM 明确 run_in_background:false）即便【不调用】
+   *   backgroundTasks()，也会被 SDK 自动后台化：出现 task_started + task_notification。
+   *   因此「前台 = 无 task 消息」只在短命令成立；长命令一律自动后台化。
+   *
+   * 观察目标：
+   * - 确认基线（不调用 backgroundTasks）也出现 task_started/task_notification
+   * - 确认 query 仍阻塞到任务结束（自动后台化不改变阻塞语义）
+   * - 与 case-13 对比：两者事件序列应基本一致 → 证明 backgroundTasks() 在此场景无效
+   */
+  it('case-12 基线: 前台长命令（不调用 backgroundTasks，仍自动后台化）', async () => {
+    const dir = createTimestampDir('tool-foreground-background/case-12-baseline-blocking');
+
+    const { events, duration } = await collectSDKEvents({
+      prompt: `Use the Bash tool to run this exact command: ${LONG_CMD}. Run it in the foreground. Then tell me the output.`,
+      logDir: dir,
+      bypassPermissions: true,
+    });
+
+    printTimeline('Case 12: 前台长命令基线（不调用 backgroundTasks）', events, duration);
+
+    const taskAnalysis = analyzeTaskEvents(events);
+    console.error('\n── task 事件分析（基线：长命令仍自动后台化）──');
+    console.error(JSON.stringify(taskAnalysis, null, 2));
+
+    console.error(`\n[观察] query 总耗时 = ${duration}ms`);
+    console.error(`[观察] task_started=${taskAnalysis.taskStartedCount}, task_notification=${taskAnalysis.taskNotificationCount}`);
+
+    writeFileSync(`${dir}/sdk-events.json`, JSON.stringify(events, null, 2));
+
+    expect(events.length).toBeGreaterThan(0);
+
+    // 关键断言：即便不调用 backgroundTasks()，长前台 Bash 也被 SDK 自动后台化
+    expect(taskAnalysis.taskStartedCount).toBeGreaterThanOrEqual(1);
+    expect(taskAnalysis.taskNotificationCount).toBeGreaterThanOrEqual(1);
+
+    // 自动后台化不改变阻塞语义：query 仍等到任务结束（sleep 40 + 开销）
+    expect(duration).toBeGreaterThan(40000);
+  }, 180000);
+
+  /**
+   * Case 13: 核心 — 前台长命令运行中调用 backgroundTasks(toolUseId)
+   *
+   * 观察目标（对应调研假设 a/b/c/d）：
+   * a. tool_result 立刻返回 + 含 backgroundTaskId
+   * b. 收到 task_started，task_id == backgroundTaskId
+   * c. output 文件最终能读到 'bg-conversion-done'
+   * d. 收到 task_notification
+   * e. backgroundTasks() 返回值是否为 true
+   * f. 后台化后 query 是否很快结束（不再阻塞 ~20s）
+   */
+  it('case-13 前台→后台: 运行中调用 backgroundTasks(toolUseId)', async () => {
+    const dir = createTimestampDir('tool-foreground-background/case-13-foreground-to-background');
+
+    const env = { ...BASE_ENV, OTEL_LOG_RAW_API_BODIES: `file:${dir}` };
+    const queryOptions: any = {
+      env,
+      includePartialMessages: true,
+      persistSession: false,
+      settingSources: [],
+      effort: 'low',
+      permissionMode: 'bypassPermissions',
+    };
+
+    const sdkQuery = query({
+      prompt: `Use the Bash tool to run this exact command: ${LONG_CMD}. Run it in the foreground. Then tell me the output.`,
+      options: queryOptions,
+    });
+
+    // 保留 query 对象引用（带 backgroundTasks 等控制方法）
+    const queryHandle: any = sdkQuery;
+
+    const events: CapturedSDKEvent[] = [];
+    const startTime = Date.now();
+    let index = 0;
+    let backgrounded = false;
+    let backgroundResult: boolean | 'NOT_CALLED' = 'NOT_CALLED';
+    let backgroundCallAt: number | null = null;
+    let bashToolUseId: string | null = null;
+    let backgroundTaskIdFromResult: string | null = null;
+
+    for await (const message of sdkQuery) {
+      const msg = message as any;
+      const type = msg.type || 'unknown';
+      const captured: CapturedSDKEvent = {
+        index: index++,
+        type,
+        timestamp: Date.now(),
+      };
+
+      // 复用现有的字段提取逻辑
+      if (type === 'stream_event' && msg.event) {
+        const evt = msg.event;
+        captured.eventType = evt.type;
+        if (evt.type === 'content_block_start' && evt.content_block?.type === 'tool_use') {
+          captured.toolName = evt.content_block.name;
+          captured.toolUseId = evt.content_block.id;
+          // 捕获 Bash 工具调用的 tool_use_id —— 在它出现后触发后台化
+          if (evt.content_block.name === 'Bash' && !bashToolUseId) {
+            bashToolUseId = evt.content_block.id;
+          }
+        }
+        if (evt.type === 'content_block_delta' && evt.delta?.type === 'input_json_delta') {
+          captured.deltaType = 'input_json_delta';
+          captured.inputJsonSnippet = evt.delta.partial_json;
+        }
+      }
+
+      if (type === 'system') {
+        captured.subtype = msg.subtype;
+        if (msg.subtype === 'task_started') {
+          captured.taskId = msg.task_id;
+          captured.taskType = msg.task_type;
+          captured.raw = { ...msg };
+        }
+        if (msg.subtype === 'task_notification') {
+          captured.taskId = msg.task_id;
+          captured.taskStatus = msg.status;
+          captured.taskType = msg.task_type;
+          captured.raw = {
+            task_id: msg.task_id,
+            status: msg.status,
+            summary: msg.summary,
+            error: msg.error,
+            output_file: msg.output_file,
+            task_type: msg.task_type,
+            usage: msg.usage,
+            tool_use_id: msg.tool_use_id,
+          };
+        }
+      }
+
+      if (type === 'assistant' && msg.message?.content) {
+        for (const block of msg.message.content) {
+          if (block.type === 'tool_use') {
+            captured.toolName = block.name;
+            captured.toolUseId = block.id;
+            if (block.name === 'Bash' && !bashToolUseId) {
+              bashToolUseId = block.id;
+            }
+            if (!captured.raw) captured.raw = {};
+            captured.raw.toolInput = block.input;
+          }
+        }
+      }
+
+      if (type === 'user') {
+        // 提取 backgroundTaskId（前台转后台后 tool_result 应含此字段）
+        const contentBlocks = Array.isArray(msg.message?.content) ? msg.message.content : [];
+        for (const b of contentBlocks) {
+          if (b.type === 'tool_result') {
+            // backgroundTaskId 可能在结构化 content 里，也可能在 contentSnippet 文本里
+            const snippet = typeof b.content === 'string'
+              ? b.content
+              : Array.isArray(b.content)
+                ? b.content.map((c: any) => (c.type === 'text' ? c.text : '')).join('')
+                : '';
+            captured.raw = {
+              tool_use_id: b.tool_use_id,
+              contentSnippet: snippet.substring(0, 1000),
+            };
+            const m = snippet.match(/backgroundTaskId["']?\s*[:=]\s*["']?([A-Za-z0-9_-]+)/i)
+              || snippet.match(/ID:\s*([A-Za-z0-9_-]+)/i);
+            if (m && !backgroundTaskIdFromResult) {
+              backgroundTaskIdFromResult = m[1];
+            }
+          }
+        }
+      }
+
+      if (type === 'result') {
+        captured.raw = { subtype: msg.subtype, num_turns: msg.num_turns, stop_reason: msg.stop_reason };
+      }
+
+      events.push(captured);
+
+      // ── 触发后台化 ──
+      // 关键修正（第一轮教训）：必须在 Bash tool_use 一出现就调用，
+      // 即 content_block_start [Bash] 那一刻（bashToolUseId 刚被捕获）。
+      // 第一轮用 type==='assistant' 触发，结果 assistant 消息 26s 才到，
+      // 任务早已不在前台 → backgroundTasks() 返回 false。
+      if (!backgrounded && bashToolUseId) {
+        backgrounded = true;
+        backgroundCallAt = Date.now() - startTime;
+        try {
+          if (typeof queryHandle.backgroundTasks === 'function') {
+            backgroundResult = await queryHandle.backgroundTasks(bashToolUseId);
+          } else {
+            backgroundResult = 'NO_METHOD';
+          }
+        } catch (e: any) {
+          backgroundResult = `ERROR: ${e?.message || String(e)}`;
+        }
+      }
+    }
+
+    const duration = Date.now() - startTime;
+
+    // ── 输出分析 ──
+    printTimeline('Case 13: 前台→后台（调用 backgroundTasks）', events, duration);
+
+    console.error('\n── backgroundTasks() 调用结果 ──');
+    console.error(`  调用时机（query 启动后 ms）: ${backgroundCallAt}`);
+    console.error(`  返回值: ${backgroundResult}`);
+    console.error(`  从 tool_result 提取的 backgroundTaskId: ${backgroundTaskIdFromResult}`);
+
+    const taskAnalysis = analyzeTaskEvents(events);
+    console.error('\n── task 事件分析 ──');
+    console.error(JSON.stringify(taskAnalysis, null, 2));
+
+    console.error(`\n[假设 a] 后台化是否生效: ${backgroundResult === true}`);
+    console.error(`[假设 b] 是否有 task_started: ${taskAnalysis.taskStartedCount > 0}`);
+    if (taskAnalysis.taskStartedDetails[0]) {
+      console.error(`        task_started.task_id = ${taskAnalysis.taskStartedDetails[0].task_id}`);
+      console.error(`        tool_result.backgroundTaskId = ${backgroundTaskIdFromResult}`);
+      console.error(`        两者是否一致: ${taskAnalysis.taskStartedDetails[0].task_id === backgroundTaskIdFromResult}`);
+    }
+    console.error(`[假设 d] 是否有 task_notification: ${taskAnalysis.taskNotificationCount > 0}`);
+    console.error(`[假设 f] query 总耗时 = ${duration}ms（后台化后应远小于 20000，证明不再阻塞）`);
+
+    // 尝试用 output_file 读后台任务输出（假设 c）
+    const notif = taskAnalysis.taskNotificationDetails[0];
+    if (notif?.output_file) {
+      console.error(`\n[假设 c] 尝试读取 output_file: ${notif.output_file}`);
+      try {
+        const out = readFileSync(notif.output_file, 'utf-8');
+        console.error(`  文件内容（前 500 字符）:\n${out.substring(0, 500)}`);
+        console.error(`  是否包含 'bg-conversion-done': ${out.includes('bg-conversion-done')}`);
+      } catch (e: any) {
+        console.error(`  读取失败: ${e?.message || e}`);
+      }
+    } else {
+      console.error('\n[假设 c] task_notification 无 output_file，跳过读取');
+    }
+
+    writeFileSync(`${dir}/sdk-events.json`, JSON.stringify(events, null, 2));
+    writeFileSync(`${dir}/background-result.json`, JSON.stringify({
+      backgroundResult,
+      backgroundCallAt,
+      bashToolUseId,
+      backgroundTaskIdFromResult,
+      taskStarted: taskAnalysis.taskStartedDetails,
+      taskNotification: taskAnalysis.taskNotificationDetails,
+      duration,
+    }, null, 2));
+
+    expect(events.length).toBeGreaterThan(0);
+
+    // ── 实测断言（两轮实验后确立，见 raw/tool-foreground-background-behavior.md）──
+    //
+    // 在本 SDK 版本 + 本地 Kimi LLM 环境下，观察到的稳定行为是：
+    //
+    // 1. backgroundTasks() 方法在 query 对象上确实存在且可调用（不抛错）。
+    //    —— 断言：返回值不是 NOT_CALLED / NO_METHOD / ERROR。
+    // 2. 但在我们能拿到 toolUseId 的最早时刻（assistant 消息到达，约 t+44s）调用它，
+    //    返回值始终为 false —— 即没有匹配到"可后台化的前台任务"。
+    // 3. 与此同时，长前台 Bash（LLM 明确 run_in_background:false）会被 SDK 自动后台化：
+    //    出现 task_started（local_bash）+ task_notification（completed），
+    //    但 tool_result 不含 backgroundTaskId，且 query 仍阻塞到任务结束。
+    //
+    // 因此本 case 的断言改为「记录这一稳定现象」，而非「证明 backgroundTasks 生效」。
+    // 这正是 researcher 方法论中的「否定实验也是发现」。
+
+    // (1) 方法存在且被调用
+    expect(backgroundResult).not.toBe('NOT_CALLED');
+    expect(backgroundResult).not.toBe('NO_METHOD');
+    expect(typeof backgroundResult).not.toBe('string'); // 非 ERROR:xxx
+
+    // (2) 长前台 Bash 被 SDK 自动后台化：出现 task_started + task_notification
+    expect(taskAnalysis.taskStartedCount).toBeGreaterThanOrEqual(1);
+    expect(taskAnalysis.taskNotificationCount).toBeGreaterThanOrEqual(1);
+
+    // (3) 自动后台化不改变阻塞语义：query 仍等到任务结束
+    //     （sleep 40 + LLM 两轮开销，总耗时远超单次 sleep）
+    expect(duration).toBeGreaterThan(40000);
+  }, 180000);
 });

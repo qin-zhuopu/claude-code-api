@@ -379,13 +379,89 @@ const taskMsg = sysMsg as SDKSystemMessage & {
 
 ---
 
+## backgroundTasks() 前台转后台专项实验（case-12 / case-13）
+
+> 调研人：Claude Code
+> 日期：2026-07-23
+> 环境：SDK `@anthropic-ai/claude-agent-sdk` + 本地 LLM（Jereh litellm 网关 / `Jereh-Kimi-K2.6`），`permissionMode: bypassPermissions`，`settingSources: []`，`effort: low`
+> 目的：验证文档原来标注的最大未验证项 —— 「query 运行期间调用 `backgroundTasks(toolUseId)` 把前台阻塞中的工具调用转为后台，其实际效果」。
+
+### 实验设计（控制变量）
+
+| Case | 命令 | 是否调用 `backgroundTasks()` | 观察目标 |
+|------|------|----------------------------|---------|
+| 12（基线） | `sleep 40 && echo bg-conversion-done`（LLM 明确 `run_in_background:false`） | **否** | 长前台 Bash 是否产生 task 事件、是否阻塞 |
+| 13（核心） | 同上 | **是**（拿到 toolUseId 后立即调用） | 调用返回值、是否改变事件序列/阻塞行为 |
+
+两组除「是否调用 backgroundTasks」外，prompt / env / options 完全一致。
+
+### 核心发现
+
+| # | 发现 | 证据 |
+|---|------|------|
+| 13 | **长前台 Bash 被 SDK 自动后台化，与是否调用 `backgroundTasks()` 无关** | case-12（不调用）与 case-13（调用）产生**完全相同**的事件序列：`task_started`(local_bash) → `task_notification`(completed) |
+| 14 | **`backgroundTasks(toolUseId)` 在本环境下始终返回 `false`** | case-13 两轮：t+27.7s 调用 → false；t+46s 调用 → false |
+| 15 | **自动后台化不改变阻塞语义** | 即便出现 task_started/notification，query 仍阻塞到命令跑完（case-12/13 总耗时均 ≈ sleep 时长 + 两轮 LLM 开销，88–103s） |
+| 16 | **自动后台化的 tool_result 不含 `backgroundTaskId`** | case-12/13 的 user tool_result 均未提取到 backgroundTaskId；与 case-2（LLM 主动 `run_in_background:true`）的 tool_result 结构不同 |
+| 17 | **`content_block_start` 事件不含 tool_use 身份信息** | stream_event `content_block_start` 时 `toolName`/`toolUseId` 均为空；最早只能在 `assistant` 消息（完整 content）到达时才拿到 toolUseId |
+| 18 | **自动后台化的触发点**：Bash 任务开始执行后约 5s | 时间线：`assistant [Bash]`（t+44s）→ `task_started`（t+50s），间隔稳定 ~5s；两轮一致 |
+
+### 关键时间线（case-13 第二轮，sleep 40）
+
+```
+[idx=0] t+     0ms  system init
+[idx=1] t+     0ms  system status
+[idx=2] t+  7034ms  stream_event message_start
+[idx=3] t+  7036ms  stream_event content_block_start   ← tool_use 块开始，但无工具名/id
+[idx=4] t+ 44635ms  assistant [Bash] id=functions.Bash:0  ← 37s 后才拿到 toolUseId
+[idx=5] t+ 50155ms  system task_started  task_id=btl7wv7ij  ← SDK 自动后台化（任务执行 ~5s 后）
+[idx=6] t+ 87370ms  system task_notification  status=completed
+[idx=7] t+ 87378ms  user tool_result                ← 无 backgroundTaskId
+...
+[idx=15] result num_turns=2                          ← query 阻塞到任务结束
+```
+
+`backgroundTasks()` 在 idx=4 拿到 toolUseId 后立即调用（t+46s），返回 `false` —— 此时任务已被自动后台化（idx=5 在 t+50s，但 SDK 内部可能在更早就标记为后台），无可转换的"前台任务"。
+
+### `backgroundTasks()` 返回 false 的原因推断
+
+SDK 注释（`sdk.d.ts:2496`）说返回 `false` 仅当「给了 toolUseId 但没匹配到前台任务」。结合 case-12/13 的对照：
+
+1. **长前台 Bash 一旦执行超过阈值（~5s），就被 SDK 内部转为后台任务**（产生 task_started）。
+2. 转后台后，该任务在 `backgroundTasks()` 的视角里**不再是"前台任务"**，故匹配不到。
+3. 因此在本环境下，`backgroundTasks()` 对长任务**几乎总是返回 false** —— 等你能拿到 toolUseId 时（assistant 消息，往往已数秒~数十秒后），任务早已被自动后台化。
+
+> ⚠️ 这并不意味着 `backgroundTasks()` 无用。它的设计语义对应 TUI 的 Ctrl+B：在任务**仍处于前台阻塞**时主动转后台。但 SDK 的"长任务自动后台化"机制抢在了前面，使本环境下手动调用窗口极窄/不存在。
+
+### 与既有发现的关系
+
+- **case-2（LLM 主动 `run_in_background:true`）**：task_started 立即出现，tool_result **含** `backgroundTaskId`，query **不阻塞**。
+- **case-12/13（LLM `run_in_background:false`，长命令）**：task_started 延迟 ~5s 出现（自动后台化），tool_result **不含** `backgroundTaskId`，query **仍阻塞**。
+- **case-1（短命令 echo）**：命令瞬时完成，来不及触发自动后台化，无 task 事件。
+
+三者说明：**"是否产生 task 事件" ≠ "是否后台执行（非阻塞）"**。自动后台化产生了 task 事件，但保留了阻塞语义；只有 LLM 主动 `run_in_background:true`（或成功的 `backgroundTasks()` 调用）才会产生 backgroundTaskId 并解除阻塞。
+
+### 对调用方（CodePilot）的实际影响
+
+1. **不能依赖 `backgroundTasks()` 在长任务上生效** —— 本环境下它返回 false。若产品需要"长命令转后台不阻塞"，应让 LLM 直接传 `run_in_background:true`（即 case-2 路径），而非靠 SDK 控制方法。
+2. **task_notification.output_file 在自动后台化场景下为空字符串** —— case-12/13 的 notification `output_file:""`。自动后台化的输出**不写** `.output` 文件，只能从 tool_result 的 stdout 拿（而 tool_result 又不含 backgroundTaskId）。这意味着：自动后台化的长任务，其输出**只在 query 结束时通过 tool_result.stdout 一次性获得**，无法边跑边读。
+3. **若需要"边跑边读实时输出"**，唯一可靠路径是 case-2（LLM 主动后台）—— 此时 output_file 有值，可 Read。
+
+### 仍未完全确定的点
+
+1. **自动后台化的精确阈值** —— 观察到 ~5s，但未做扫描实验确认是固定值还是可配置。
+2. **`backgroundTasks()` 是否在「任务刚启动、自动后台化之前」的极窄窗口内能成功** —— 本环境下该窗口被 LLM 的 assistant 消息延迟（~44s）淹没，无法触达。需更快的 LLM 或 Anthropic 直连端点才能验证。
+3. **自动后台化是否受 `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` 抑制** —— case-7 显示该变量不阻止 LLM 主动后台，但对"自动后台化"的影响未单独验证。
+
+---
+
 ## 未验证行为
 
-1. **`backgroundTasks()` 方法** — 在 query 运行期间调用该方法的实际效果未验证（需要在 SDK async iterator 运行中调用）
+1. ~~**`backgroundTasks()` 方法**~~ — **已验证（case-12/13，2026-07-23）**：方法存在且可调用，但本环境下对长任务返回 false（见上节）。剩余不确定点：极窄窗口内是否可成功。
 2. **Monitor 工具** — 需要 Anthropic 直连端点 + 遥测启用，本地环境不可用
-3. **前台→后台→前台完整状态机** — 需要 `backgroundTasks()` 方法配合
+3. **前台→后台→前台完整状态机** — 部分验证（自动后台化已确认，但"手动转后台成功"未观测到）
 4. **task_progress 消息的完整结构** — 观察到有推送，但未解析完整字段
 5. **`task_updated` 消息的用途** — 观察到出现，但未分析其结构
 6. **SSE cases (9-11)** — NestJS 服务端 SSE 传输的 task 消息包装格式未验证
 7. **`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` 的真实影响范围** — 需要更精确的控制变量实验
-8. **长运行后台任务的 task_notification completed 状态** — case-2 因超时未等到 completed
+8. **长运行后台任务的 task_notification completed 状态** — case-2 因超时未等到 completed；case-12/13 已观测到 completed（但 output_file 为空）
