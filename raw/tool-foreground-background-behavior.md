@@ -474,6 +474,8 @@ SDK 注释（`sdk.d.ts:2496`）说返回 `false` 仅当「给了 toolUseId 但�
 > 日期：2026-07-24
 > 环境：SDK `@anthropic-ai/claude-agent-sdk` + 本地 LLM（LOCAL 网关 `10.1.3.115:4000` / `Jereh-LLM-NO-THINK-V1`），`permissionMode: bypassPermissions`，`settingSources: []`，`effort: low`
 > 目的：验证 case-13 遗留假设 —— 「backgroundTasks() 返回 false 是不是因为用了 string-prompt（单次）模式？」。SDK 类型注释（`sdk.d.ts:2229-2230`）明确：**控制方法（interrupt/backgroundTasks/stopTask/streamInput）只在 streaming input/output 模式下支持**。
+>
+> ⚠️ **重要更正（case-17 已查明真因）**：本节发现 19「backgroundTasks 仍返回 false」的归因【是错的】。真因不是 streaming 模式、不是自动后台化抢先，而是**调用时机早于 `task_started` 事件**。case-14 在 9290ms 调用，但 task_started 在 13515ms 才发出——那时任务尚未注册为可控制对象，故 false。case-17 证明：等 task_started 后再调，backgroundTasks 返回 **true** 且成功转后台。详见文末「case-17」节。以下 case-14 原始记录保留，但发现 19 的结论以 case-17 为准。
 
 ### 实验设计
 
@@ -568,11 +570,73 @@ query 结束:        57762ms  ← result subtype=success, terminal_reason=comple
 
 | 控制方法 | 调用结果 | 是否停/转任务 | query 是否存活 | 阻塞是否解除 | 适用场景 |
 |---------|---------|-------------|--------------|------------|---------|
-| `backgroundTasks(toolUseId)`（case-14） | **false** | 否（任务已自动后台化） | 存活 | 否（等满 sleep） | 本环境下对长任务无效 |
-| `stopTask(taskId)`（case-15） | **OK** | 是，任务→stopped | **存活，可续轮** | 是（21s vs 57s） | **停单个后台任务 + 继续会话（首选）** |
+| `backgroundTasks(toolUseId)` **在 task_started 后调**（case-17） | **true** | 是，转后台成功 | **存活，可续轮** | **是（第一轮 turn 12.8s 结束）** | **主动转后台长命令（时机正确即可用）** |
+| `backgroundTasks(toolUseId)` **在 task_started 前调**（case-14） | false | 否（任务未注册） | 存活 | 否（等满 sleep） | 时机错误 → 无效 |
+| `stopTask(taskId)`（case-15） | **OK** | 是，任务→stopped | **存活，可续轮** | 是（21s vs 57s） | **停单个后台任务 + 继续会话** |
 | `interrupt()`（case-16，窗口内） | **OK** | 打断整个当前 turn | 结束当前 turn（但 streaming 可续轮） | 是（13.5s） | 打断正阻塞的 turn（TUI Esc），时机敏感 |
 
 **给 CodePilot 的最终建议**：
-- 要"停一个卡住的后台任务、会话继续"→ 用 **stopTask(taskId)**（taskId 从 task_started/task_notification 收集）。
-- 要"用户按 Esc 打断当前操作"→ 用 **interrupt()**，但必须在 turn 活跃时同步调用，不能延迟。
-- **不要用 backgroundTasks() 手动转后台长命令**——本环境返回 false，SDK 已自动后台化。
+- **所有控制方法（backgroundTasks/stopTask）必须在收到 `task_started` 事件之后调用**——那时任务才被注册为可控制对象。在此之前调用一律无效（backgroundTasks 返回 false）。这是贯穿 case-13→17 的核心结论。
+- 要"主动把长命令转后台、不阻塞会话"→ 用 **backgroundTasks(toolUseId)**，但**必须等 task_started**（toolUseId 用 task_started.tool_use_id，与 assistant block.id 一致）。成功后 tool_result 带 backgroundTaskId，turn 立即继续。
+- 要"停一个卡住的后台任务、会话继续"→ 用 **stopTask(taskId)**（taskId 从 task_started 收集）。
+- 要"用户按 Esc 打断当前操作"→ 用 **interrupt()**，须在 turn 活跃时同步调用，不能延迟。
+
+---
+
+## backgroundTasks 时机验证（case-17，解开 case-13→17 谜团）
+
+> 调研人：Claude Code
+> 日期：2026-07-24
+> 环境：同 case-14/15/16
+> 目的：验证真因假设 —— 「backgroundTasks 返回 false 是因为调用早于 task_started 事件」。
+
+### 真因假设的由来（case-14/15 时序反推）
+
+对比 case-14（false）与 case-15（stopTask OK）的精确时序，发现规律：**控制方法成功与否，取决于调用时 `task_started` 是否已发出**。
+
+| case | 控制调用时机 | task_started 时机 | 调用 vs task_started | 结果 |
+|------|------------|------------------|---------------------|------|
+| case-14 backgroundTasks | 9290ms | **13515ms** | 早 4.2s | **false** |
+| case-15 stopTask | 12669ms | 10509ms | 晚 2.2s | OK |
+
+且 case-15 已确认 `task_started.tool_use_id === assistant block.id`（都是 `call_6dc0...`），排除「ID 不匹配」假设。
+
+### 实验设计
+
+把 backgroundTasks 的触发条件从「拿到 assistant block.id」改为「**收到 task_started**」，并用 `task_started.tool_use_id` 调用。其余同 case-14。
+
+### 决定性发现
+
+| # | 发现 | 证据（case-17 实测） |
+|---|------|---------------------|
+| 37 | **task_started 之后调 backgroundTasks 返回 `true`** —— 彻底推翻 case-13/14 的 false 结论 | `bgCallResult: true`（调用@14237ms，task_started@14237ms） |
+| 38 | **真因 = 调用时机相对 task_started**，与 streaming 模式、自动后台化、ID 匹配均无关 | case-14 早 4.2s→false；case-17 同刻/后→true |
+| 39 | **成功后 tool_result 带 `backgroundTaskId`**（case-14 失败时为 null） | `backgroundTaskIdFromResult: bvjfc5bax`，等于 `bashTaskId` |
+| 40 | **转后台真正解除阻塞**：第一轮 turn 在 12860ms 结束（不等 sleep 40） | 时序：task_started@11848 → tool_result@12859 → result@12860（turn 结束）；后台任务 49248ms 才 task_notification completed |
+| 41 | **完整走通「转后台→续轮→任务后台完成」**：turnsObserved=3，第二轮 AI 正确报告任务已完成 | 第二轮回答："background task is finished, exit code 0, output bg-17-done" |
+| 42 | **实证 sdk.d.ts:2866 描述的标准行为**：转后台后 tool_result 立即返回「running in background」、turn 继续、任务后台跑完发 task_notification | 首次在本环境完整观测到该行为链 |
+
+### 关键时序（case-17）
+
+```
+t+11848ms  task_started（任务注册，tool_use_id=call_bbfe26...）
+t+14237ms  backgroundTasks(tool_use_id) → true   ← 在 task_started 之后调
+（tool_result 带 backgroundTaskId=bvjfc5bax，turn 立即继续）
+t+12860ms  第一轮 result（turn 结束，未等 sleep 40）*
+t+12868ms  第二轮开始（streaming 续推 msg2）
+t+49248ms  task_notification status=completed（后台任务真正跑完）
+t+53936ms  全部结束
+```
+（*注：不同运行的绝对时间戳略有出入，但「turn 在任务完成前就结束」这一相对关系稳定成立。）
+
+### 谜团总收束（case-13 → case-17）
+
+历经 5 个 case，backgroundTasks 返回 false 的真因逐层澄清，我的错误归因被逐一推翻：
+
+1. **case-13**：string-prompt 模式下 false → 猜测「可能是没开 streaming 模式」。
+2. **case-14**：streaming 模式下【仍】false → 推翻猜测 1；改猜「自动后台化抢先/任务已不是前台」。
+3. **case-15/16**：stopTask 和同步 interrupt 都成功，且都在 task_started 之后 → 露出「时机」线索。
+4. **时序反推**：发现 case-14 的 backgroundTasks 实际在 task_started【之前】4.2s 调用 → 推翻猜测 2（自动后台化其实发生在调用【之后】）。
+5. **case-17**：等 task_started 后再调 → **true** → 真因确认：**必须在 task_started 之后调用**。
+
+**最终真相**：SDK 的控制方法（backgroundTasks/stopTask）操作的是「已注册的后台任务对象」，该对象在 `task_started` 事件发出时才存在。早于此调用，SDK 匹配不到任务 → 返回 false（backgroundTasks）或潜在失败。这与输入模式（string/streaming）、SDK 自动后台化、tool_use_id 匹配都无关，是纯粹的**事件时序依赖**。
