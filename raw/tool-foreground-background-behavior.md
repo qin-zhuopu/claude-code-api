@@ -22,6 +22,19 @@
 | 10 | **task_notification 完成时有 `usage` 字段**（含 total_tokens/tool_uses/duration_ms），失败时没有 | Case 5(failed) vs Case 6(completed) |
 | 11 | **task_started for Agent 额外包含 `subagent_type` 和 `prompt` 字段** | Case 4,5 |
 | 12 | **task_started for Workflow 额外包含 `workflow_name` 和 `prompt` 字段** | Case 6 |
+| 51 | **task_progress 每条含固定 10 键**（type/subtype/task_id/tool_use_id/description/subagent_type/usage/last_tool_name/uuid/session_id），subagent 场景带 `subagent_type`（值 `general-purpose`） | Case 20 |
+| 52 | **task_progress.usage.tool_uses 随步骤单调递增（1→4）、duration_ms 累加**；但 `total_tokens` 恒为 0 —— 本地网关不在进度消息里回报 token | Case 20 |
+| 53 | **task_progress.description = `Running <step>`、last_tool_name = 子代理最近所用工具（Bash）** —— 逐步反映子任务进展 | Case 20 |
+| 54 | **task_progress 推送频率 ≈ 7-9s**（跟随子代理每步节奏，非固定心跳；本例 4 步 4 条推送） | Case 20 |
+| 55 | **task_progress.task_id == 该 subagent 的 task_started.task_id** | Case 20 |
+| 56 | **首次观测到 `task_updated.patch.status = killed`**（stopTask 触发）；该 patch 仅含 `{status, end_time}` 两键 | Case 21 |
+| 57 | **同一次停止，两个通道状态词不同**：`task_updated.patch.status = killed` 而 `task_notification.status = stopped`（相差 ~33ms 先后到达） | Case 21 |
+| 58 | **`paused` 状态与 `is_backgrounded` 翻转均未在 task_updated 中观测到** —— 本环境无 pause 路径，自动后台化不经由 task_updated.patch 暴露 is_backgrounded | Case 21 |
+| 59 | **无参 `backgroundTasks()` 返回 `true` 并批量后台化当前前台任务**，query 立即解除阻塞、可续轮（对应 TUI Ctrl+B） | Case 22 |
+| 60 | **本地 LLM 串行执行多条 Bash（工具层不支持并发）** —— 故批量场景实际只有 1 个前台任务在跑，无参后台化作用于「全部前台任务」= 该 1 个 | Case 22 |
+| 61 | **智谱 GLM（glm-5.2）能真正并发起 2 个前台 Bash**（同消息一次发出）—— 证实 case-22 的并发限制来自模型能力而非 SDK | Case 22b |
+| 62 | **无参 `backgroundTasks()` 一次批量转后台 2 个任务、返回 `true`** —— 首次压满「无参 = 后台化全部前台任务」的批量语义（TUI Ctrl+B） | Case 22b |
+| 63 | **换模型可作控制变量隔离「模型能力 vs SDK 机制」** —— 同一代码路径本地 LLM 转 1 个、GLM 转 2 个 | Case 22b |
 
 ---
 
@@ -460,8 +473,8 @@ SDK 注释（`sdk.d.ts:2496`）说返回 `false` 仅当「给了 toolUseId 但�
 1. ~~**`backgroundTasks()` 方法**~~ — **已验证（case-12/13，2026-07-23）**：方法存在且可调用，但本环境下对长任务返回 false（见上节）。剩余不确定点：极窄窗口内是否可成功。
 2. **Monitor 工具** — 需要 Anthropic 直连端点 + 遥测启用，本地环境不可用
 3. **前台→后台→前台完整状态机** — 部分验证（自动后台化已确认，但"手动转后台成功"未观测到）
-4. **task_progress 消息的完整结构** — 观察到有推送，但未解析完整字段
-5. **`task_updated` 消息的用途** — 观察到出现，但未分析其结构
+4. ~~**task_progress 消息的完整结构**~~ — **已验证（case-20，2026-07-25）**：固定 10 键，usage.tool_uses/duration_ms 累加，含 subagent_type/last_tool_name/description；`summary` 可选常缺省，`total_tokens` 本地网关恒 0（见发现 51-55）
+5. ~~**`task_updated` 消息的用途**~~ — **已验证（case-21，2026-07-25）**：是「异常/停止」事件通道，patch 携带变化字段子集。首次触发 `killed`（patch 仅 `{status,end_time}`）；正常完成不发 task_updated（见发现 56-58）
 6. **SSE cases (9-11)** — NestJS 服务端 SSE 传输的 task 消息包装格式未验证
 7. **`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` 的真实影响范围** — 需要更精确的控制变量实验
 8. **长运行后台任务的 task_notification completed 状态** — case-2 因超时未等到 completed；case-12/13 已观测到 completed（但 output_file 为空）
@@ -729,3 +742,126 @@ case-18a（`seq 1 8`，16s）测出「前台 SDK 事件流无增量 stdout」，
 | SDK 事件流（query 调用方） | tool_result 一次性 | tool_result 一次性（事件流不逐字流 stdout） | tool_result 立即返回 backgroundTaskId |
 | `.output` 文件 | 可能不产生 | **实时增长，可 tail**（case-19） | **实时增长，可 tail**（case-18b） |
 | TUI Ctrl+O | 结束后展开看 | **实时可见（读 .output 文件，推断）** | 实时可见 |
+
+---
+
+## 生命周期补完三缺口（case-20 / case-21 / case-22）
+
+> 调研人：Claude Code
+> 日期：2026-07-25
+> 环境：同 case-14~19（LOCAL 网关 `10.1.3.115:4000` / `Jereh-LLM-NO-THINK-V1`），`permissionMode: bypassPermissions`，`settingSources: []`，`effort: low`
+> 目的：钉死后台任务生命周期最后三个 SDK 明确定义、本地可复现的缺口 —— `task_progress` 完整字段（case-20）、`task_updated` 状态机（case-21）、无参 `backgroundTasks()` 批量语义（case-22）。三者对应 SDK 类型 `SDKTaskProgressMessage`（sdk.d.ts:4192-4214）、`SDKTaskUpdatedMessage`（sdk.d.ts:4238-4258）、`backgroundTasks(toolUseId?)`（sdk.d.ts:2496）。
+
+### case-20：task_progress 完整字段（长 subagent 进度推送）
+
+让 Agent 工具启动一个 `general-purpose` subagent，顺序跑 4 条 `echo step-N && sleep 3` 命令，拉长执行时间以多触发进度推送。实测收到 **4 条 task_progress**（对应 4 个步骤）。
+
+**task_progress 消息完整字段**（每条固定 10 键）：
+```json
+{
+  "type": "system",
+  "subtype": "task_progress",
+  "task_id": "aedb3f87ecb0f6adb",
+  "tool_use_id": "call_e6fb6412b86d4195a1b632cd",
+  "description": "Running Execute step-2 command",
+  "subagent_type": "general-purpose",
+  "usage": { "total_tokens": 0, "tool_uses": 2, "duration_ms": 13205 },
+  "last_tool_name": "Bash",
+  "uuid": "...",
+  "session_id": "..."
+}
+```
+
+| # | 发现 | 证据（case-20 实测） |
+|---|------|---------------------|
+| 51 | **task_progress 每条含固定 10 键** —— type/subtype/task_id/tool_use_id/description/subagent_type/usage/last_tool_name/uuid/session_id | `rawKeys` 四条推送完全一致 |
+| 52 | **usage.tool_uses 单调递增（1→2→3→4）、duration_ms 累加（3674→13205→20018→26916）**，但 `total_tokens` 恒为 0 | 本地网关不在进度消息里回报 token |
+| 53 | **description = `Running Execute step-N command`（子任务描述）、last_tool_name = 子代理最近所用工具（全程 Bash）** | 逐步反映子任务进展 |
+| 54 | **推送间隔 ≈ 7-9s（9536/6809/6899ms）** —— 跟随子代理每步节奏，非固定心跳 | 4 步产生 4 条推送 |
+| 55 | **task_progress.task_id == 该 subagent 的 task_started.task_id** | `task_id=aedb3f87ecb0f6adb` 命中 task_started 集合 |
+
+**推送时间线**（相对 query 启动）：
+```
+t+27009ms  progress #1  step-1  tool_uses=1  duration_ms=3674
+t+36545ms  progress #2  step-2  tool_uses=2  duration_ms=13205
+t+43354ms  progress #3  step-3  tool_uses=3  duration_ms=20018
+t+50253ms  progress #4  step-4  tool_uses=4  duration_ms=26916
+```
+
+> ⚠️ **诚实标注**：`summary` 字段在本次 4 条推送中【均未出现】（sdk.d.ts 标为可选 `summary?`）。`total_tokens` 恒 0 是本地网关特性，不代表 SDK 语义 —— Anthropic 直连端点很可能回报真实 token。
+
+### case-21：task_updated 状态机（首次触发 killed）
+
+用 streaming-input 跑 `sleep 40` 长 Bash，等 task_started 后立即 `stopTask(taskId)`，收集所有 task_updated.patch。实测 **1 条 task_updated**，patch.status = **killed**（本项目首次观测到该状态）。
+
+**task_updated 消息**：
+```json
+{
+  "type": "system",
+  "subtype": "task_updated",
+  "task_id": "b1i9xuyw0",
+  "patch": { "status": "killed", "end_time": 1784927034021 }
+}
+```
+
+| # | 发现 | 证据（case-21 实测） |
+|---|------|---------------------|
+| 56 | **首次观测到 `task_updated.patch.status = killed`**（stopTask 触发），patch 仅含 `{status, end_time}` 两键 | `patchKeyUnion: ["status","end_time"]` |
+| 57 | **同一次停止两个通道状态词不同**：`task_updated.patch.status = killed`，而 `task_notification.status = stopped`（先后相差 ~33ms：stopTask@12201 → 两者@12234） | 双通道并存 |
+| 58 | **`paused` 与 `is_backgrounded` 翻转均未观测到** —— 本环境无 pause 路径；自动后台化不经 task_updated.patch 暴露 is_backgrounded | `sawPaused:false, bgFlips:[]` |
+
+**状态机重建（本环境实测路径）**：
+```
+task_started(running，隐含)  →  [stopTask]  →  task_updated.patch.status = killed
+                                             ↘  task_notification.status = stopped
+```
+result.subtype 仍为 `success`（沿用 case-15/16 结论：stopTask 不改变 query 终态），总耗时 16176ms（sleep 40 被真正中断）。
+
+> ⚠️ **否定发现**：SDK 定义的 6 态中，本环境只跑出 `killed`（经 task_updated）+ `running`（隐含）。`pending/completed/failed/paused` 未经由 task_updated.patch 观测到 —— 短任务直接走 task_notification 报 completed/failed，不产生独立的 task_updated；`paused` 无本地触发路径（可能仅 TUI/特定 workflow 场景）。**这说明 task_updated 在本环境是「异常/停止」事件通道，正常完成不发 task_updated**。
+
+### case-22：无参 backgroundTasks() 批量后台化（对应 TUI Ctrl+B）
+
+要求 LLM 用 Bash 连跑两条前台 `sleep 30` 命令，等 task_started 后调用**不带 toolUseId** 的 `backgroundTasks()`。
+
+| # | 发现 | 证据（case-22 实测） |
+|---|------|---------------------|
+| 59 | **无参 `backgroundTasks()` 返回 `true` 并批量后台化当前前台任务**，query 立即解除阻塞（21259ms 结束，未等满 sleep 30）、续轮成功（turnsObserved=3） | `bgCallResult: true`（@17227ms） |
+| 60 | **本地 LLM 串行执行多条 Bash（工具层不支持并发）** —— 实际只有 1 个前台任务在跑，故批量作用于「全部前台任务」= 该 1 个 | `taskStartedIds` 只 1 个（`b6cexnq23`），LLM 明确回复「the tools prevent that（并发）」 |
+
+**时间线**：
+```
+t+12726ms  task_started #1  b6cexnq23（第一条 sleep 30）
+t+17227ms  backgroundTasks() 无参调用 → true（调用前 task_started 数=1）
+t+21259ms  query 第一轮 result（解除阻塞，续轮问"几个后台任务"）
+t+26344ms  task_notification b6cexnq23 status=stopped
+```
+
+> ⚠️ **批量语义受限说明**：本 case 目标是验证「无参 = 后台化所有前台任务」。但本地 LLM 无法并发起两个 Bash（工具层串行），第二条命令要等第一条完成才发，导致调用无参 backgroundTasks 时**只有 1 个前台任务**。因此我们**证实了无参形式可用且返回 true、批量后台化了当前所有（1 个）前台任务**，但**未能在「2 个同时前台」场景下验证一次转多个** —— 这是本地 LLM 串行执行的环境限制，非 SDK 限制。要验证真正的批量（N>1），需要能并发起多个后台任务的场景（如多个 Agent subagent 并行）或更强模型。**此缺口已由 case-22b 用智谱 GLM 补上（见下）。**
+
+### case-22b：智谱 GLM 压满批量语义（换模型控制变量实验）
+
+case-22 的批量语义没压满，怀疑「并发限制来自模型能力」而非 SDK。用**智谱 GLM（主/subagent `glm-5.2`，haiku `glm-4.5-air`，走 BIGMODEL 组）重跑同一实验**（唯一变量：env 换网关，prompt/观察逻辑与 case-22 完全一致）。
+
+| # | 发现 | 证据（case-22b 实测） |
+|---|------|---------------------|
+| 61 | **GLM 真正并发起 2 个前台 Bash**（把两条命令放同一消息一次发出）—— 推翻「并发限制来自 SDK」的可能，证实是**模型能力差异** | `taskStartedIds: ["bfznjqe2e","bzrnz09jq"]`，分别 @15091ms / @15094ms（相隔仅 3ms）；GLM 明确输出「I'll issue both Bash calls in the same message so they run concurrently」 |
+| 62 | **无参 `backgroundTasks()` 一次批量转后台 2 个任务、返回 `true`** —— 首次在本项目压满「无参 = 后台化全部前台任务」的批量语义（TUI Ctrl+B） | `bgCallResult: true`（@15190ms，调用前 task_started 数=2）；`uniqueBgTaskIds` 提取到 2 个 backgroundTaskId |
+| 63 | **两个后台任务的 task_notification 几乎同刻到达**（28150 / 28151ms，均 `stopped`），query 未等满 sleep 30 即在 23048ms 结束、续轮成功 | `notifStatuses` 两条 stopped；`turnsObserved: 6`；`resultSubtype: success` |
+
+**时间线（case-22b）**：
+```
+t+15091ms  task_started #1  bfznjqe2e（sleep 30 A）┐ 相隔 3ms，真并发
+t+15094ms  task_started #2  bzrnz09jq（sleep 30 B）┘
+t+15190ms  backgroundTasks() 无参调用 → true（调用前 task_started 数=2）
+t+23048ms  query 第一轮 result（解除阻塞，续轮问"几个后台任务"，GLM 正确答 2 个）
+t+28150ms  task_notification bfznjqe2e status=stopped
+t+28151ms  task_notification bzrnz09jq status=stopped
+```
+
+> ✅ **结论**：无参 `backgroundTasks()` 的批量语义（一次后台化 N 个前台任务）在 N=2 场景下**得到确证**。case-22 只转 1 个的原因**确定是本地 Jereh LLM 的串行执行**（工具层不支持同消息多 Bash），而非 SDK 限制 —— 换成能并发的 GLM 后，同样的代码路径一次转了 2 个。这也验证了「换模型」作为控制变量能有效隔离「模型能力 vs SDK 机制」。
+
+### 三 case 对 CodePilot 的实际影响
+
+1. **task_progress 可驱动"运行中进度"UI**：用 `usage.tool_uses`/`duration_ms` 做进度指示，`description`/`last_tool_name` 做当前动作文案，`subagent_type` 分发组件。注意 `total_tokens` 在本地网关恒 0、`summary` 可能缺省，UI 需容错。
+2. **task_updated 是"异常/停止"通道，不是"每步状态"通道**：正常完成的任务【不发】task_updated，只发 task_notification。渲染状态流转时，`killed` 来自 task_updated.patch，而 `stopped/completed/failed` 来自 task_notification —— **两个通道要合并去重**（同一次停止会同时来 killed + stopped）。
+3. **无参 backgroundTasks() 可作"全部转后台"按钮**（Ctrl+B 语义），返回 true 即解除阻塞。但要注意任务须已 task_started（沿用 case-17 铁律）。

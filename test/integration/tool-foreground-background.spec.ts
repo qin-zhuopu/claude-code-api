@@ -54,6 +54,28 @@ const BASE_ENV = {
   OTEL_TRACES_EXPORTER: 'none',
 };
 
+// 智谱 GLM 配置（BIGMODEL 组，open.bigmodel.cn anthropic 兼容端点）。
+// 用途：case-22b 验证并发前台 Bash —— 本地 Jereh LLM 工具层串行、起不了并发，
+// 用能力更强的 GLM 看能否真正起 2 个并发前台 Bash，从而压满无参 backgroundTasks 的批量语义。
+// token / base_url 走 .env 的 BIGMODEL__ 组；模型名按用户指定：主/subagent=glm-5.2，haiku=glm-4.5-air。
+const BIGMODEL_ENV = {
+  ANTHROPIC_AUTH_TOKEN: process.env.BIGMODEL__ANTHROPIC_AUTH_TOKEN,
+  ANTHROPIC_BASE_URL: process.env.BIGMODEL__ANTHROPIC_BASE_URL,
+  ANTHROPIC_MODEL: 'glm-5.2',
+  CLAUDE_CODE_SUBAGENT_MODEL: 'glm-5.2',
+  ANTHROPIC_DEFAULT_OPUS_MODEL: 'glm-5.2',
+  ANTHROPIC_DEFAULT_SONNET_MODEL: 'glm-5.2',
+  ANTHROPIC_DEFAULT_HAIKU_MODEL: 'glm-4.5-air',
+  CLAUDE_CODE_WORKFLOWS: '1',
+  CLAUDE_CODE_USE_POWERSHELL_TOOL: '1',
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+  CLAUDE_CODE_ENABLE_TELEMETRY: '1',
+  API_TIMEOUT_MS: '3000000',
+  OTEL_LOGS_EXPORTER: 'none',
+  OTEL_METRICS_EXPORTER: 'none',
+  OTEL_TRACES_EXPORTER: 'none',
+};
+
 // ====== 事件收集工具 ======
 
 interface CapturedSDKEvent {
@@ -2856,4 +2878,803 @@ describe('前台命令 .output 文件通道', () => {
     expect(events.length).toBeGreaterThan(0);
     // 纯记录，实时性结论靠上面数据（researcher：断结构不断结论）
   }, 180000);
+});
+
+// ====== task_progress 完整字段解析（case-20）======
+//
+// 缘起：raw/tool-foreground-background-behavior.md 发现 6 只知道 workflow「有 task_progress
+// 推送（2-3 次）」，但从未解析过该消息的字段级内容。sdk.d.ts:4192-4214 定义
+// SDKTaskProgressMessage 含：description（必填）、subagent_type?、last_tool_name?、
+// summary?、usage.{total_tokens,tool_uses,duration_ms}（必填）。本 case 跑一个会持续
+// 推送进度的长任务，逐条捕获 task_progress 的完整字段 + 推送时间戳（算频率）。
+//
+// 任务选择：subagent（Agent 工具）——它是唯一带 subagent_type 的场景（sdk.d.ts 注释
+// 明确 subagent_type 是「Subagent type for Task tool subagents」）。让 subagent 连续跑
+// 多个 Bash 命令，拉长执行时间、多触发进度推送，同时观察 last_tool_name 是否随之变化。
+//
+// 观察目标：
+//   P1 task_progress 是否出现？出现几次？推送间隔（频率）？
+//   P2 每条 task_progress 的字段：description / subagent_type / last_tool_name / summary
+//   P3 usage 子字段：total_tokens / tool_uses / duration_ms 是否随进度累加？
+//   P4 task_progress.task_id 是否等于同任务的 task_started.task_id？
+
+describe('task_progress 完整字段', () => {
+  it('case-20 task_progress: 长 subagent 的进度推送字段', async () => {
+    const dir = createTimestampDir('tool-foreground-background/case-20-task-progress');
+
+    const t0 = Date.now();
+    const env = { ...BASE_ENV, OTEL_LOG_RAW_API_BODIES: `file:${dir}` };
+
+    // 让 subagent 连续做多步（多次 Bash），拉长时间、多推进度
+    const sdkQuery = query({
+      prompt: `Use the Agent tool to launch a subagent. Instruct the subagent to run these Bash commands one by one, in order, waiting for each: (1) echo step-1 && sleep 3, (2) echo step-2 && sleep 3, (3) echo step-3 && sleep 3, (4) echo step-4 && sleep 3. After all four finish, report done. Then tell me the subagent's result.`,
+      options: { env, includePartialMessages: true, persistSession: false, settingSources: [], effort: 'low', permissionMode: 'bypassPermissions' } as any,
+    });
+
+    // 逐条捕获 task_progress 完整字段 + 时间戳
+    interface ProgressSnap {
+      relMs: number;
+      task_id: string;
+      tool_use_id?: string;
+      description?: string;
+      subagent_type?: string;
+      last_tool_name?: string;
+      summary?: string;
+      usage?: { total_tokens?: number; tool_uses?: number; duration_ms?: number };
+      rawKeys: string[];
+    }
+    const progressSnaps: ProgressSnap[] = [];
+    const taskStartedIds: string[] = [];
+    let taskStartedType: string | null = null;
+    let taskStartedSubagentType: string | null = null;
+
+    const events: CapturedSDKEvent[] = [];
+    let index = 0;
+    for await (const message of sdkQuery) {
+      const msg = message as any;
+      const type = msg.type || 'unknown';
+      const rel = Date.now() - t0;
+      const captured: CapturedSDKEvent = { index: index++, type, timestamp: Date.now() };
+
+      if (type === 'stream_event' && msg.event) {
+        captured.eventType = msg.event.type;
+        if (msg.event.type === 'content_block_delta' && msg.event.delta?.type === 'text_delta') {
+          process.stderr.write(msg.event.delta.text);
+        }
+      }
+
+      if (type === 'system') {
+        captured.subtype = msg.subtype;
+        if (msg.subtype === 'task_started') {
+          captured.taskId = msg.task_id;
+          captured.taskType = msg.task_type;
+          taskStartedIds.push(msg.task_id);
+          if (!taskStartedType) taskStartedType = msg.task_type ?? null;
+          if (!taskStartedSubagentType) taskStartedSubagentType = msg.subagent_type ?? null;
+          console.error(`\n[${rel}ms] task_started task_id=${msg.task_id} task_type=${msg.task_type} subagent_type=${msg.subagent_type ?? '-'}`);
+        }
+        if (msg.subtype === 'task_progress') {
+          const snap: ProgressSnap = {
+            relMs: rel,
+            task_id: msg.task_id,
+            tool_use_id: msg.tool_use_id,
+            description: msg.description,
+            subagent_type: msg.subagent_type,
+            last_tool_name: msg.last_tool_name,
+            summary: msg.summary,
+            usage: msg.usage,
+            rawKeys: Object.keys(msg),
+          };
+          progressSnaps.push(snap);
+          captured.taskId = msg.task_id;
+          captured.raw = snap;
+          console.error(`\n[${rel}ms] ⚡ task_progress #${progressSnaps.length}: last_tool=${msg.last_tool_name ?? '-'} subagent_type=${msg.subagent_type ?? '-'} usage=${JSON.stringify(msg.usage)} desc="${(msg.description ?? '').substring(0, 60)}" summary="${(msg.summary ?? '').substring(0, 60)}"`);
+        }
+        if (msg.subtype === 'task_notification') {
+          captured.taskId = msg.task_id;
+          captured.taskStatus = msg.status;
+          console.error(`\n[${rel}ms] task_notification status=${msg.status}`);
+        }
+      }
+
+      events.push(captured);
+    }
+
+    const duration = Date.now() - t0;
+
+    // 推送频率：相邻 task_progress 的时间间隔
+    const intervals: number[] = [];
+    for (let i = 1; i < progressSnaps.length; i++) {
+      intervals.push(progressSnaps[i].relMs - progressSnaps[i - 1].relMs);
+    }
+    const avgInterval = intervals.length ? Math.round(intervals.reduce((a, b) => a + b, 0) / intervals.length) : null;
+
+    // usage 是否累加（total_tokens 单调不减？）
+    const totalTokensSeq = progressSnaps.map(s => s.usage?.total_tokens ?? null);
+    const toolUsesSeq = progressSnaps.map(s => s.usage?.tool_uses ?? null);
+    const lastToolSeq = progressSnaps.map(s => s.last_tool_name ?? null);
+
+    console.error('\n══════ P1-P4 实测值 ══════');
+    console.error(`[P1] task_progress 出现次数: ${progressSnaps.length}；推送间隔(ms): ${JSON.stringify(intervals)}；平均 ${avgInterval}ms`);
+    console.error(`[P2] task_type=${taskStartedType} subagent_type(task_started)=${taskStartedSubagentType}`);
+    console.error(`[P2] progress 字段 key 并集: ${JSON.stringify([...new Set(progressSnaps.flatMap(s => s.rawKeys))])}`);
+    console.error(`[P2] last_tool_name 序列: ${JSON.stringify(lastToolSeq)}`);
+    console.error(`[P3] usage.total_tokens 序列: ${JSON.stringify(totalTokensSeq)}`);
+    console.error(`[P3] usage.tool_uses 序列: ${JSON.stringify(toolUsesSeq)}`);
+    console.error(`[P4] task_progress.task_id ⊆ task_started.task_id 集合: ${progressSnaps.every(s => taskStartedIds.includes(s.task_id))}（task_started ids=${JSON.stringify(taskStartedIds)}）`);
+
+    writeFileSync(`${dir}/sdk-events.json`, JSON.stringify(events, null, 2));
+    writeFileSync(`${dir}/task-progress.json`, JSON.stringify({
+      progressCount: progressSnaps.length,
+      intervals, avgInterval,
+      taskStartedIds, taskStartedType, taskStartedSubagentType,
+      totalTokensSeq, toolUsesSeq, lastToolSeq,
+      progressSnaps, duration,
+    }, null, 2));
+
+    expect(events.length).toBeGreaterThan(0);
+    // 结构断言：若有 task_progress，每条必带 task_id 与 usage（sdk.d.ts 标为必填）
+    for (const s of progressSnaps) {
+      expect(typeof s.task_id).toBe('string');
+      expect(s.usage).toBeDefined();
+    }
+    // 否定结果记录：本地 LLM 可能不触发 subagent 或不产生多次进度推送
+    if (progressSnaps.length === 0) {
+      console.error('[否定发现] 未观测到 task_progress —— 记录（本地 LLM 未走 subagent 或任务太快）');
+    }
+  }, 120000);
+});
+
+// ====== task_updated 状态机重建（case-21）======
+//
+// 缘起：raw 文档「未验证行为 5」标注 task_updated「观察到出现，但未分析其结构」。
+// sdk.d.ts:4238-4258 定义 SDKTaskUpdatedMessage.patch 含 status（6 态：
+// pending|running|completed|failed|killed|paused）、description、end_time、
+// total_paused_ms、error、is_backgrounded。case-14 曾顺带打印过 patch，但从未系统
+// 重建状态机，且 paused / killed 两态此前从未观测到。
+//
+// 本 case 用 streaming-input 模式跑长 Bash，收集所有 task_updated.patch，重建状态序列，
+// 并主动 stopTask 尝试触发 killed；观察 is_backgrounded 布尔翻转时机。
+//
+// 观察目标：
+//   Q1 task_updated 出现几次？patch 里出现过哪些字段（key 并集）？
+//   Q2 status 状态序列（重建状态机）——能否观测到 pending→running→...→killed/completed？
+//   Q3 stopTask 后是否出现 status=killed（此前从未观测）？还是走 completed/failed？
+//   Q4 is_backgrounded 何时从 false/缺省 翻转为 true（自动后台化时刻）？
+//   Q5 end_time / total_paused_ms / error 字段在何种 patch 中出现？
+
+describe('task_updated 状态机', () => {
+  const LONG_CMD_21 = 'sleep 40 && echo bg-21-done';
+
+  it('case-21 task_updated: 重建状态机 + 尝试触发 killed/paused', async () => {
+    const dir = createTimestampDir('tool-foreground-background/case-21-task-updated');
+
+    const state = {
+      queryStartedAt: Date.now(),
+      bashTaskId: null as string | null,
+      taskStartedAt: null as number | null,
+      stopCallResult: 'NOT_CALLED' as 'NOT_CALLED' | 'OK' | 'NO_METHOD' | string,
+      stopCallAt: null as number | null,
+      queryEnded: false,
+      queryEndedAt: null as number | null,
+      resultSubtype: null as string | null,
+    };
+
+    // 逐条 task_updated 快照
+    interface PatchSnap {
+      relMs: number;
+      task_id: string;
+      status?: string;
+      description?: string;
+      end_time?: number;
+      total_paused_ms?: number;
+      error?: string;
+      is_backgrounded?: boolean;
+      patchKeys: string[];
+    }
+    const patchSnaps: PatchSnap[] = [];
+    const notifSnaps: { relMs: number; status: string }[] = [];
+
+    const events: CapturedSDKEvent[] = [];
+
+    let resolveTurn2: () => void = () => {};
+    const turn2Gate = new Promise<void>((r) => { resolveTurn2 = r; });
+    const turn2Timeout = new Promise<void>((r) => setTimeout(r, 20000));
+
+    const msg1: any = {
+      type: 'user',
+      message: { role: 'user', content: `Use the Bash tool to run this exact command: ${LONG_CMD_21}. Run it in the foreground. Do NOT set run_in_background.` },
+      parent_tool_use_id: null,
+    };
+    const msg2: any = {
+      type: 'user',
+      message: { role: 'user', content: 'What is the final status of the background task? Just report it. Do NOT run new commands.' },
+      parent_tool_use_id: null,
+      priority: 'now',
+    };
+
+    async function* promptInput(): AsyncIterable<any> {
+      yield msg1;
+      await Promise.race([turn2Gate, turn2Timeout]);
+      console.error(`\n[gen] turn2 放行 @ ${Date.now() - state.queryStartedAt}ms`);
+      yield msg2;
+    }
+
+    const env = { ...BASE_ENV, OTEL_LOG_RAW_API_BODIES: `file:${dir}` };
+    const queryOptions: any = {
+      env, includePartialMessages: true, persistSession: false,
+      settingSources: [], effort: 'low', permissionMode: 'bypassPermissions',
+    };
+
+    const sdkQuery = query({ prompt: promptInput(), options: queryOptions });
+    const queryHandle: any = sdkQuery;
+
+    const observer = setInterval(() => {
+      const t = Date.now() - state.queryStartedAt;
+      console.error(`[obs t=${t}ms] taskId=${state.bashTaskId ?? '-'} stop=${state.stopCallResult} patches=${patchSnaps.length} ended=${state.queryEnded}`);
+    }, 1000);
+
+    let index = 0;
+    try {
+      for await (const message of sdkQuery) {
+        const msg = message as any;
+        const type = msg.type || 'unknown';
+        const rel = Date.now() - state.queryStartedAt;
+        const captured: CapturedSDKEvent = { index: index++, type, timestamp: Date.now() };
+
+        if (type === 'stream_event' && msg.event) {
+          captured.eventType = msg.event.type;
+          if (msg.event.type === 'content_block_delta' && msg.event.delta?.type === 'text_delta') {
+            process.stderr.write(msg.event.delta.text);
+          }
+        }
+
+        if (type === 'system') {
+          captured.subtype = msg.subtype;
+          if (msg.subtype === 'task_started') {
+            captured.taskId = msg.task_id;
+            captured.raw = { ...msg };
+            if (!state.bashTaskId) {
+              state.bashTaskId = msg.task_id;
+              state.taskStartedAt = rel;
+              console.error(`\n[${rel}ms] task_started task_id=${msg.task_id} task_type=${msg.task_type}`);
+            }
+          }
+          if (msg.subtype === 'task_updated') {
+            const p = msg.patch || {};
+            const snap: PatchSnap = {
+              relMs: rel,
+              task_id: msg.task_id,
+              status: p.status,
+              description: p.description,
+              end_time: p.end_time,
+              total_paused_ms: p.total_paused_ms,
+              error: p.error,
+              is_backgrounded: p.is_backgrounded,
+              patchKeys: Object.keys(p),
+            };
+            patchSnaps.push(snap);
+            captured.taskId = msg.task_id;
+            captured.raw = { patch: p };
+            console.error(`\n[${rel}ms] ⚡ task_updated #${patchSnaps.length} patch=${JSON.stringify(p)}`);
+          }
+          if (msg.subtype === 'task_notification') {
+            captured.taskId = msg.task_id;
+            captured.taskStatus = msg.status;
+            notifSnaps.push({ relMs: rel, status: msg.status });
+            console.error(`\n[${rel}ms] task_notification status=${msg.status}`);
+            resolveTurn2();
+          }
+        }
+
+        if (type === 'assistant' && msg.message?.content) {
+          for (const block of msg.message.content) {
+            if (block.type === 'tool_use') {
+              captured.toolName = block.name;
+              captured.toolUseId = block.id;
+            }
+          }
+        }
+
+        if (type === 'result') {
+          captured.raw = { subtype: msg.subtype, num_turns: msg.num_turns, terminal_reason: msg.terminal_reason };
+          state.queryEnded = true;
+          state.queryEndedAt = rel;
+          state.resultSubtype = msg.subtype;
+          console.error(`\n[${rel}ms] result subtype=${msg.subtype} num_turns=${msg.num_turns}`);
+          resolveTurn2();
+        }
+
+        events.push(captured);
+
+        // ── 控制调用：等 task_started 后 stopTask，尝试触发 killed ──
+        if (state.bashTaskId && state.stopCallResult === 'NOT_CALLED') {
+          state.stopCallAt = rel;
+          console.error(`\n[stopTask] 调用 @ ${state.stopCallAt}ms（尝试触发 killed），taskId=${state.bashTaskId}`);
+          try {
+            if (typeof queryHandle.stopTask === 'function') {
+              await queryHandle.stopTask(state.bashTaskId);
+              state.stopCallResult = 'OK';
+            } else {
+              state.stopCallResult = 'NO_METHOD';
+            }
+          } catch (e: any) {
+            state.stopCallResult = `ERROR: ${e?.message || e}`;
+          }
+          console.error(`[stopTask] 结果: ${state.stopCallResult}`);
+        }
+      }
+    } finally {
+      clearInterval(observer);
+    }
+
+    const duration = Date.now() - state.queryStartedAt;
+    if (!state.queryEnded) state.queryEndedAt = duration;
+
+    // 重建状态机：status 序列（去掉 undefined）
+    const statusSeq = patchSnaps.map(s => s.status).filter(Boolean);
+    const distinctStatuses = [...new Set(statusSeq)];
+    const patchKeyUnion = [...new Set(patchSnaps.flatMap(s => s.patchKeys))];
+    // is_backgrounded 翻转
+    const bgFlips = patchSnaps.filter(s => s.is_backgrounded !== undefined).map(s => ({ relMs: s.relMs, is_backgrounded: s.is_backgrounded }));
+    const sawKilled = statusSeq.includes('killed');
+    const sawPaused = statusSeq.includes('paused');
+
+    console.error('\n══════ Q1-Q5 实测值 ══════');
+    console.error(`[Q1] task_updated 出现 ${patchSnaps.length} 次；patch key 并集: ${JSON.stringify(patchKeyUnion)}`);
+    console.error(`[Q2] status 序列（状态机）: ${JSON.stringify(statusSeq)}；去重: ${JSON.stringify(distinctStatuses)}`);
+    console.error(`[Q3] stopTask 结果=${state.stopCallResult}@${state.stopCallAt}ms；是否观测到 killed: ${sawKilled}；task_notification 状态: ${JSON.stringify(notifSnaps)}`);
+    console.error(`[Q4] is_backgrounded 翻转记录: ${JSON.stringify(bgFlips)}（task_started@${state.taskStartedAt}ms）`);
+    console.error(`[Q5] 是否观测到 paused: ${sawPaused}；含 end_time 的 patch: ${JSON.stringify(patchSnaps.filter(s => s.end_time !== undefined).map(s => ({ relMs: s.relMs, end_time: s.end_time })))}；含 error 的 patch: ${JSON.stringify(patchSnaps.filter(s => s.error !== undefined))}；含 total_paused_ms 的 patch: ${JSON.stringify(patchSnaps.filter(s => s.total_paused_ms !== undefined))}`);
+    console.error(`[补充] result.subtype=${state.resultSubtype}，总耗时=${duration}ms`);
+
+    writeFileSync(`${dir}/sdk-events.json`, JSON.stringify(events, null, 2));
+    writeFileSync(`${dir}/task-updated.json`, JSON.stringify({
+      patchCount: patchSnaps.length,
+      statusSeq, distinctStatuses, patchKeyUnion, bgFlips,
+      sawKilled, sawPaused,
+      stopCallResult: state.stopCallResult, stopCallAt: state.stopCallAt,
+      notifSnaps, resultSubtype: state.resultSubtype, duration,
+      patchSnaps,
+    }, null, 2));
+
+    // ── 断言 ──
+    expect(events.length).toBeGreaterThan(0);
+    // stopTask 方法存在且被调用
+    expect(state.stopCallResult).not.toBe('NOT_CALLED');
+    expect(state.stopCallResult).not.toBe('NO_METHOD');
+    // 结构断言：若有 task_updated，patch 必是对象且每条带 task_id
+    for (const s of patchSnaps) {
+      expect(typeof s.task_id).toBe('string');
+      expect(Array.isArray(s.patchKeys)).toBe(true);
+    }
+    // 否定发现记录
+    if (!sawKilled) console.error('[否定发现] 未观测到 status=killed —— 记录（stopTask 可能走 completed/stopped 而非 killed patch）');
+    if (!sawPaused) console.error('[否定发现] 未观测到 status=paused —— 记录（本环境无 pause 触发路径）');
+  }, 120000);
+});
+
+// ====== backgroundTasks() 无参数批量后台化（case-22）======
+//
+// 缘起：case-13/14/17 只测了带 toolUseId 的【单任务】backgroundTasks 形式。
+// sdk.d.ts:2496 的 backgroundTasks 签名 toolUseId 可选——不传时应后台化【所有】前台
+// 任务（对应 TUI Ctrl+B 的批量后台化）。本 case 先启动两个前台 Bash 任务，等它们
+// task_started 后调用无参 backgroundTasks()，观察返回值与被转后台的任务数。
+//
+// 关键前提（沿用 case-17 决定性结论）：控制方法必须在 task_started【之后】调用才生效。
+// 故这里等【至少一个】task_started 后再调；为尽量让两个任务都注册，等到收到 2 个
+// task_started 或超时窗口后触发。
+//
+// 观察目标：
+//   S1 无参 backgroundTasks() 返回值（true/false）？
+//   S2 调用前有几个前台任务在跑？调用后有几个被转后台（task_started 计数 / tool_result 带 backgroundTaskId 计数）？
+//   S3 与单任务形式（case-17）对比：无参是否批量作用于全部？
+//   S4 query 是否解除阻塞、可续轮？
+
+describe('backgroundTasks() 无参批量后台化', () => {
+  // 两个中等长度命令，确保都进入执行、都能 task_started
+  const CMD_A = 'sleep 30 && echo bg-22-A-done';
+  const CMD_B = 'sleep 30 && echo bg-22-B-done';
+
+  it('case-22 backgroundTasks(): 无参数批量转后台', async () => {
+    const dir = createTimestampDir('tool-foreground-background/case-22-bg-noarg-batch');
+
+    const state = {
+      queryStartedAt: Date.now(),
+      taskStartedIds: [] as string[],
+      taskStartedAtMs: [] as number[],
+      bgCallResult: 'NOT_CALLED' as boolean | 'NOT_CALLED' | 'NO_METHOD' | string,
+      bgCallAt: null as number | null,
+      bgTaskIdsFromResult: [] as string[],
+      queryEnded: false,
+      queryEndedAt: null as number | null,
+      resultSubtype: null as string | null,
+      turnsObserved: 0,
+    };
+
+    const events: CapturedSDKEvent[] = [];
+    const notifStatuses: { relMs: number; task_id: string; status: string }[] = [];
+
+    let resolveTurn2: () => void = () => {};
+    const turn2Gate = new Promise<void>((r) => { resolveTurn2 = r; });
+    const turn2Timeout = new Promise<void>((r) => setTimeout(r, 25000));
+
+    // 一条消息里要求跑两个后台化候选命令（前台，靠自动/手动后台化）
+    const msg1: any = {
+      type: 'user',
+      message: { role: 'user', content: `Use the Bash tool TWICE to start two separate foreground commands. First run this exact command: ${CMD_A}. Then run this exact command: ${CMD_B}. Do NOT set run_in_background on either. Run them so both are executing.` },
+      parent_tool_use_id: null,
+    };
+    const msg2: any = {
+      type: 'user',
+      message: { role: 'user', content: 'How many background tasks are currently running? Just report the count. Do NOT run new commands.' },
+      parent_tool_use_id: null,
+      priority: 'now',
+    };
+
+    async function* promptInput(): AsyncIterable<any> {
+      yield msg1;
+      await Promise.race([turn2Gate, turn2Timeout]);
+      console.error(`\n[gen] turn2 放行 @ ${Date.now() - state.queryStartedAt}ms`);
+      yield msg2;
+    }
+
+    const env = { ...BASE_ENV, OTEL_LOG_RAW_API_BODIES: `file:${dir}` };
+    const queryOptions: any = {
+      env, includePartialMessages: true, persistSession: false,
+      settingSources: [], effort: 'low', permissionMode: 'bypassPermissions',
+    };
+
+    const sdkQuery = query({ prompt: promptInput(), options: queryOptions });
+    const queryHandle: any = sdkQuery;
+
+    // 观察者：等到第一个 task_started 后再给 ~3s 窗口收集第二个，然后调无参 backgroundTasks
+    let bgTriggered = false;
+    const observer = setInterval(() => {
+      const t = Date.now() - state.queryStartedAt;
+      console.error(`[obs t=${t}ms] taskStarted=${state.taskStartedIds.length} bgCall=${state.bgCallResult} ended=${state.queryEnded}`);
+      // 触发条件：至少 1 个 task_started，且（收到 2 个 或 距首个 task_started 已 > 4s）
+      if (
+        !bgTriggered &&
+        state.taskStartedIds.length >= 1 &&
+        state.bgCallResult === 'NOT_CALLED' &&
+        !state.queryEnded &&
+        (state.taskStartedIds.length >= 2 || (state.taskStartedAtMs[0] != null && t - state.taskStartedAtMs[0] > 4000))
+      ) {
+        bgTriggered = true;
+        state.bgCallAt = t;
+        const startedBefore = state.taskStartedIds.length;
+        console.error(`\n[backgroundTasks] 无参调用 @ ${t}ms（调用前 task_started 数=${startedBefore}）`);
+        (async () => {
+          try {
+            if (typeof queryHandle.backgroundTasks === 'function') {
+              state.bgCallResult = await queryHandle.backgroundTasks();
+            } else {
+              state.bgCallResult = 'NO_METHOD';
+            }
+          } catch (e: any) {
+            state.bgCallResult = `ERROR: ${e?.message || e}`;
+          }
+          console.error(`[backgroundTasks] 无参返回: ${state.bgCallResult}`);
+          resolveTurn2();
+        })();
+      }
+    }, 1000);
+
+    let index = 0;
+    try {
+      for await (const message of sdkQuery) {
+        const msg = message as any;
+        const type = msg.type || 'unknown';
+        const rel = Date.now() - state.queryStartedAt;
+        const captured: CapturedSDKEvent = { index: index++, type, timestamp: Date.now() };
+
+        if (type === 'stream_event' && msg.event) {
+          captured.eventType = msg.event.type;
+          if (msg.event.type === 'content_block_delta' && msg.event.delta?.type === 'text_delta') {
+            process.stderr.write(msg.event.delta.text);
+          }
+        }
+
+        if (type === 'system') {
+          captured.subtype = msg.subtype;
+          if (msg.subtype === 'task_started') {
+            captured.taskId = msg.task_id;
+            captured.taskType = msg.task_type;
+            state.taskStartedIds.push(msg.task_id);
+            state.taskStartedAtMs.push(rel);
+            console.error(`\n[${rel}ms] task_started #${state.taskStartedIds.length} task_id=${msg.task_id} task_type=${msg.task_type}`);
+          }
+          if (msg.subtype === 'task_updated') {
+            captured.taskId = msg.task_id;
+            captured.raw = { patch: msg.patch };
+            console.error(`\n[${rel}ms] task_updated patch=${JSON.stringify(msg.patch)}`);
+          }
+          if (msg.subtype === 'task_notification') {
+            captured.taskId = msg.task_id;
+            captured.taskStatus = msg.status;
+            notifStatuses.push({ relMs: rel, task_id: msg.task_id, status: msg.status });
+            console.error(`\n[${rel}ms] task_notification task_id=${msg.task_id} status=${msg.status}`);
+          }
+        }
+
+        if (type === 'assistant' && msg.message?.content) {
+          state.turnsObserved++;
+          for (const block of msg.message.content) {
+            if (block.type === 'tool_use') {
+              captured.toolName = block.name;
+              captured.toolUseId = block.id;
+              if (!captured.raw) captured.raw = {};
+              captured.raw.toolInput = block.input;
+            }
+          }
+        }
+
+        if (type === 'user') {
+          const cb = Array.isArray(msg.message?.content) ? msg.message.content : [];
+          for (const b of cb) {
+            if (b.type === 'tool_result') {
+              const snippet = typeof b.content === 'string' ? b.content
+                : Array.isArray(b.content) ? b.content.map((c: any) => (c.type === 'text' ? c.text : '')).join('') : '';
+              captured.raw = { tool_use_id: b.tool_use_id, contentSnippet: snippet.substring(0, 500) };
+              const m = snippet.match(/backgroundTaskId["']?\s*[:=]\s*["']?([A-Za-z0-9_-]+)/i) || snippet.match(/ID:\s*([A-Za-z0-9_-]+)/i);
+              if (m) state.bgTaskIdsFromResult.push(m[1]);
+            }
+          }
+        }
+
+        if (type === 'result') {
+          captured.raw = { subtype: msg.subtype, num_turns: msg.num_turns, terminal_reason: msg.terminal_reason };
+          state.queryEnded = true;
+          state.queryEndedAt = rel;
+          state.resultSubtype = msg.subtype;
+          console.error(`\n[${rel}ms] result subtype=${msg.subtype} num_turns=${msg.num_turns}`);
+          resolveTurn2();
+        }
+
+        events.push(captured);
+      }
+    } finally {
+      clearInterval(observer);
+    }
+
+    const duration = Date.now() - state.queryStartedAt;
+    if (!state.queryEnded) state.queryEndedAt = duration;
+
+    const uniqueBgTaskIds = [...new Set(state.bgTaskIdsFromResult)];
+
+    console.error('\n══════ S1-S4 实测值 ══════');
+    console.error(`[S1] 无参 backgroundTasks() 返回: ${state.bgCallResult}（调用@${state.bgCallAt}ms）`);
+    console.error(`[S2] 调用前观测到的 task_started 数: ${state.taskStartedIds.length}（ids=${JSON.stringify(state.taskStartedIds)}，各@${JSON.stringify(state.taskStartedAtMs)}ms）`);
+    console.error(`[S2] tool_result 提取到的 backgroundTaskId: ${JSON.stringify(uniqueBgTaskIds)}（${uniqueBgTaskIds.length} 个）`);
+    console.error(`[S3] task_notification 状态: ${JSON.stringify(notifStatuses)}`);
+    console.error(`[S4] query 是否结束=${state.queryEnded}@${state.queryEndedAt}ms；turnsObserved=${state.turnsObserved}；result.subtype=${state.resultSubtype}；总耗时=${duration}ms`);
+
+    writeFileSync(`${dir}/sdk-events.json`, JSON.stringify(events, null, 2));
+    writeFileSync(`${dir}/bg-noarg-batch.json`, JSON.stringify({
+      bgCallResult: state.bgCallResult, bgCallAt: state.bgCallAt,
+      taskStartedIds: state.taskStartedIds, taskStartedAtMs: state.taskStartedAtMs,
+      uniqueBgTaskIds, notifStatuses,
+      queryEnded: state.queryEnded, queryEndedAt: state.queryEndedAt,
+      resultSubtype: state.resultSubtype, turnsObserved: state.turnsObserved, duration,
+    }, null, 2));
+
+    // ── 断言 ──
+    expect(events.length).toBeGreaterThan(0);
+    // 无参 backgroundTasks 方法存在且被调用（非没调/没方法）
+    expect(state.bgCallResult).not.toBe('NOT_CALLED');
+    expect(state.bgCallResult).not.toBe('NO_METHOD');
+    // 否定发现记录：本地 LLM 可能只起一个任务，或无参调用返回 false
+    if (state.taskStartedIds.length < 2) {
+      console.error(`[否定发现] 只观测到 ${state.taskStartedIds.length} 个 task_started（期望 2）—— 本地 LLM 可能串行/只起一个，批量语义验证受限`);
+    }
+  }, 120000);
+});
+
+// ══════════════════════════════════════════════════════════════════
+// case-22b: 用智谱 GLM（glm-5.2）重跑无参 backgroundTasks 批量语义
+//
+// 动机：case-22 在本地 Jereh LLM 上因「工具层串行、起不了并发前台 Bash」
+// 只观测到 1 个 task_started，无法压满「无参 backgroundTasks 一次转多个」的批量语义。
+// 本 case 换能力更强的 GLM，看能否真正起 2 个并发前台 Bash → 若能，则无参调用应一次转 ≥2 个。
+// 控制变量：仅换 env（BIGMODEL_ENV），prompt/观察逻辑与 case-22 完全一致。
+// ══════════════════════════════════════════════════════════════════
+describe('backgroundTasks() 无参批量 — 智谱 GLM 并发验证', () => {
+  const CMD_A = 'sleep 30 && echo bg-22b-A-done';
+  const CMD_B = 'sleep 30 && echo bg-22b-B-done';
+
+  it('case-22b GLM: 并发前台 Bash + 无参 backgroundTasks 批量转后台', async () => {
+    const dir = createTimestampDir('tool-foreground-background/case-22b-glm-batch');
+
+    const state = {
+      queryStartedAt: Date.now(),
+      taskStartedIds: [] as string[],
+      taskStartedAtMs: [] as number[],
+      bgCallResult: 'NOT_CALLED' as boolean | 'NOT_CALLED' | 'NO_METHOD' | string,
+      bgCallAt: null as number | null,
+      bgTaskIdsFromResult: [] as string[],
+      queryEnded: false,
+      queryEndedAt: null as number | null,
+      resultSubtype: null as string | null,
+      turnsObserved: 0,
+    };
+
+    const events: CapturedSDKEvent[] = [];
+    const notifStatuses: { relMs: number; task_id: string; status: string }[] = [];
+
+    let resolveTurn2: () => void = () => {};
+    const turn2Gate = new Promise<void>((r) => { resolveTurn2 = r; });
+    const turn2Timeout = new Promise<void>((r) => setTimeout(r, 25000));
+
+    const msg1: any = {
+      type: 'user',
+      message: { role: 'user', content: `Use the Bash tool TWICE to start two separate foreground commands. First run this exact command: ${CMD_A}. Then run this exact command: ${CMD_B}. Do NOT set run_in_background on either. Run them so both are executing.` },
+      parent_tool_use_id: null,
+    };
+    const msg2: any = {
+      type: 'user',
+      message: { role: 'user', content: 'How many background tasks are currently running? Just report the count. Do NOT run new commands.' },
+      parent_tool_use_id: null,
+      priority: 'now',
+    };
+
+    async function* promptInput(): AsyncIterable<any> {
+      yield msg1;
+      await Promise.race([turn2Gate, turn2Timeout]);
+      console.error(`\n[gen] turn2 放行 @ ${Date.now() - state.queryStartedAt}ms`);
+      yield msg2;
+    }
+
+    // 唯一变量：env 换成 BIGMODEL_ENV（智谱 GLM）
+    const env = { ...BIGMODEL_ENV, OTEL_LOG_RAW_API_BODIES: `file:${dir}` };
+    const queryOptions: any = {
+      env, includePartialMessages: true, persistSession: false,
+      settingSources: [], effort: 'low', permissionMode: 'bypassPermissions',
+    };
+
+    const sdkQuery = query({ prompt: promptInput(), options: queryOptions });
+    const queryHandle: any = sdkQuery;
+
+    // 观察者：等到第一个 task_started 后再给 ~4s 窗口收集第二个，然后调无参 backgroundTasks
+    let bgTriggered = false;
+    const observer = setInterval(() => {
+      const t = Date.now() - state.queryStartedAt;
+      console.error(`[obs t=${t}ms] taskStarted=${state.taskStartedIds.length} bgCall=${state.bgCallResult} ended=${state.queryEnded}`);
+      if (
+        !bgTriggered &&
+        state.taskStartedIds.length >= 1 &&
+        state.bgCallResult === 'NOT_CALLED' &&
+        !state.queryEnded &&
+        (state.taskStartedIds.length >= 2 || (state.taskStartedAtMs[0] != null && t - state.taskStartedAtMs[0] > 4000))
+      ) {
+        bgTriggered = true;
+        state.bgCallAt = t;
+        const startedBefore = state.taskStartedIds.length;
+        console.error(`\n[backgroundTasks] 无参调用 @ ${t}ms（调用前 task_started 数=${startedBefore}）`);
+        (async () => {
+          try {
+            if (typeof queryHandle.backgroundTasks === 'function') {
+              state.bgCallResult = await queryHandle.backgroundTasks();
+            } else {
+              state.bgCallResult = 'NO_METHOD';
+            }
+          } catch (e: any) {
+            state.bgCallResult = `ERROR: ${e?.message || e}`;
+          }
+          console.error(`[backgroundTasks] 无参返回: ${state.bgCallResult}`);
+          resolveTurn2();
+        })();
+      }
+    }, 1000);
+
+    let index = 0;
+    try {
+      for await (const message of sdkQuery) {
+        const msg = message as any;
+        const type = msg.type || 'unknown';
+        const rel = Date.now() - state.queryStartedAt;
+        const captured: CapturedSDKEvent = { index: index++, type, timestamp: Date.now() };
+
+        if (type === 'stream_event' && msg.event) {
+          captured.eventType = msg.event.type;
+          if (msg.event.type === 'content_block_delta' && msg.event.delta?.type === 'text_delta') {
+            process.stderr.write(msg.event.delta.text);
+          }
+        }
+
+        if (type === 'system') {
+          captured.subtype = msg.subtype;
+          if (msg.subtype === 'task_started') {
+            captured.taskId = msg.task_id;
+            captured.taskType = msg.task_type;
+            state.taskStartedIds.push(msg.task_id);
+            state.taskStartedAtMs.push(rel);
+            console.error(`\n[${rel}ms] task_started #${state.taskStartedIds.length} task_id=${msg.task_id} task_type=${msg.task_type}`);
+          }
+          if (msg.subtype === 'task_updated') {
+            captured.taskId = msg.task_id;
+            captured.raw = { patch: msg.patch };
+            console.error(`\n[${rel}ms] task_updated patch=${JSON.stringify(msg.patch)}`);
+          }
+          if (msg.subtype === 'task_notification') {
+            captured.taskId = msg.task_id;
+            captured.taskStatus = msg.status;
+            notifStatuses.push({ relMs: rel, task_id: msg.task_id, status: msg.status });
+            console.error(`\n[${rel}ms] task_notification task_id=${msg.task_id} status=${msg.status}`);
+          }
+        }
+
+        if (type === 'assistant' && msg.message?.content) {
+          state.turnsObserved++;
+          for (const block of msg.message.content) {
+            if (block.type === 'tool_use') {
+              captured.toolName = block.name;
+              captured.toolUseId = block.id;
+              if (!captured.raw) captured.raw = {};
+              captured.raw.toolInput = block.input;
+            }
+          }
+        }
+
+        if (type === 'user') {
+          const cb = Array.isArray(msg.message?.content) ? msg.message.content : [];
+          for (const b of cb) {
+            if (b.type === 'tool_result') {
+              const snippet = typeof b.content === 'string' ? b.content
+                : Array.isArray(b.content) ? b.content.map((c: any) => (c.type === 'text' ? c.text : '')).join('') : '';
+              captured.raw = { tool_use_id: b.tool_use_id, contentSnippet: snippet.substring(0, 500) };
+              const m = snippet.match(/backgroundTaskId["']?\s*[:=]\s*["']?([A-Za-z0-9_-]+)/i) || snippet.match(/ID:\s*([A-Za-z0-9_-]+)/i);
+              if (m) state.bgTaskIdsFromResult.push(m[1]);
+            }
+          }
+        }
+
+        if (type === 'result') {
+          captured.raw = { subtype: msg.subtype, num_turns: msg.num_turns, terminal_reason: msg.terminal_reason };
+          state.queryEnded = true;
+          state.queryEndedAt = rel;
+          state.resultSubtype = msg.subtype;
+          console.error(`\n[${rel}ms] result subtype=${msg.subtype} num_turns=${msg.num_turns}`);
+          resolveTurn2();
+        }
+
+        events.push(captured);
+      }
+    } finally {
+      clearInterval(observer);
+    }
+
+    const duration = Date.now() - state.queryStartedAt;
+    if (!state.queryEnded) state.queryEndedAt = duration;
+
+    const uniqueBgTaskIds = [...new Set(state.bgTaskIdsFromResult)];
+
+    console.error('\n══════ case-22b GLM 实测值 ══════');
+    console.error(`[G1] 无参 backgroundTasks() 返回: ${state.bgCallResult}（调用@${state.bgCallAt}ms）`);
+    console.error(`[G2] 调用前观测到的 task_started 数: ${state.taskStartedIds.length}（ids=${JSON.stringify(state.taskStartedIds)}，各@${JSON.stringify(state.taskStartedAtMs)}ms）`);
+    console.error(`[G2] tool_result 提取到的 backgroundTaskId: ${JSON.stringify(uniqueBgTaskIds)}（${uniqueBgTaskIds.length} 个）`);
+    console.error(`[G3] task_notification 状态: ${JSON.stringify(notifStatuses)}`);
+    console.error(`[G4] query 是否结束=${state.queryEnded}@${state.queryEndedAt}ms；turnsObserved=${state.turnsObserved}；result.subtype=${state.resultSubtype}；总耗时=${duration}ms`);
+    console.error(`[G5] 并发判定: ${state.taskStartedIds.length >= 2 ? '✅ GLM 起了 ≥2 个前台任务，批量语义可压满' : '❌ 仍只 ' + state.taskStartedIds.length + ' 个，GLM 在本 SDK 下也未并发'}`);
+
+    writeFileSync(`${dir}/sdk-events.json`, JSON.stringify(events, null, 2));
+    writeFileSync(`${dir}/glm-batch.json`, JSON.stringify({
+      model: 'glm-5.2', haikuModel: 'glm-4.5-air',
+      bgCallResult: state.bgCallResult, bgCallAt: state.bgCallAt,
+      taskStartedIds: state.taskStartedIds, taskStartedAtMs: state.taskStartedAtMs,
+      uniqueBgTaskIds, notifStatuses,
+      queryEnded: state.queryEnded, queryEndedAt: state.queryEndedAt,
+      resultSubtype: state.resultSubtype, turnsObserved: state.turnsObserved, duration,
+    }, null, 2));
+
+    // ── 断言（宽松，先观察）──
+    expect(events.length).toBeGreaterThan(0);
+    expect(state.bgCallResult).not.toBe('NOT_CALLED');
+    expect(state.bgCallResult).not.toBe('NO_METHOD');
+    if (state.taskStartedIds.length >= 2) {
+      console.error(`[发现] ✅ GLM 起了 ${state.taskStartedIds.length} 个并发前台任务 —— 无参 backgroundTasks 批量语义得到验证`);
+    } else {
+      console.error(`[否定发现] GLM 仍只起 ${state.taskStartedIds.length} 个 task_started —— 并发受限可能来自 SDK 工具层而非模型能力`);
+    }
+  }, 120000);
 });
