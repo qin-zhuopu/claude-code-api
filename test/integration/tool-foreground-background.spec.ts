@@ -25,7 +25,7 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { INestApplication, ValidationPipe } from '@nestjs/common';
 import { AppModule } from '../../src/app.module';
 import { createTimestampDir } from './helpers';
-import { writeFileSync, readFileSync } from 'fs';
+import { writeFileSync, readFileSync, existsSync } from 'fs';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -2501,4 +2501,218 @@ describe('task_started 后调 backgroundTasks', () => {
     expect(state.bgCallResult).not.toBe('NO_METHOD');
     expect(typeof state.bgCallResult).not.toBe('string'); // 返回了 boolean
   }, 240000);
+});
+
+// ====== 前台/后台输出实时性验证（case-18）======
+//
+// 缘起：此前对"前台 Bash 输出是一次性返回"的说法，是从 case-1（echo 瞬时命令）
+// 过度推断的——echo 太快，无法区分"实时"还是"一次性"。官方 streaming-output 文档
+// 只讲 text_delta / input_json_delta（LLM 文本和工具入参的流式），【未提及】工具
+// 执行的 stdout 输出是否流式。故本 case 用【慢速多行】命令拿确凿证据。
+//
+// 命令：for i in $(seq 1 8); do echo tick-$i; sleep 2; done —— 约 16s，分 8 次输出。
+//
+// case-18a（前台）：观察 tool_result 出现的时机与内容。
+//   Y1 tool_result 是【命令跑完后一次性】带全部 8 行 stdout，还是执行期间增量推送？
+//   Y2 执行期间是否有携带 stdout 内容的事件（区别于只带耗时的 tool_progress）？
+//   Y3 从 tool_use 出现到 tool_result 出现，间隔是否 ≈16s（证明阻塞到跑完）？
+//
+// case-18b（后台）：后台跑同样命令，每秒读 .output 文件。
+//   Z1 .output 文件是否存在、内容是否随时间【逐步增长】（证明后台输出可实时 tail）？
+//   Z2 记录每秒快照的行数，看是否呈阶梯增长（tick-1, tick-2, ...）。
+
+describe('前台/后台输出实时性', () => {
+  // 8 行、每行间隔 2s，约 16s
+  const SLOW_CMD = 'for i in $(seq 1 8); do echo tick-$i; sleep 2; done';
+
+  it('case-18a 前台: tool_result 是一次性还是增量', async () => {
+    const dir = createTimestampDir('tool-foreground-background/case-18a-fg-realtime');
+
+    const t0 = Date.now();
+    const timeline: any[] = [];       // 记录带 stdout 内容的事件时机
+    let toolUseAt: number | null = null;
+    let toolResultAt: number | null = null;
+    let toolResultStdout: string | null = null;
+    let toolResultLineCount = 0;
+    let sawIncrementalStdout = false; // 执行期间是否见到携带部分 stdout 的事件
+
+    const env = { ...BASE_ENV, OTEL_LOG_RAW_API_BODIES: `file:${dir}` };
+    const sdkQuery = query({
+      prompt: `Use the Bash tool to run this exact command in the FOREGROUND (do NOT set run_in_background): ${SLOW_CMD}. Then report how many lines were printed.`,
+      options: { env, includePartialMessages: true, persistSession: false, settingSources: [], effort: 'low', permissionMode: 'bypassPermissions' } as any,
+    });
+
+    const events: CapturedSDKEvent[] = [];
+    let index = 0;
+    for await (const message of sdkQuery) {
+      const msg = message as any;
+      const type = msg.type || 'unknown';
+      const rel = Date.now() - t0;
+      const captured: CapturedSDKEvent = { index: index++, type, timestamp: Date.now() };
+
+      if (type === 'stream_event' && msg.event) {
+        captured.eventType = msg.event.type;
+      }
+
+      // assistant 里的 Bash tool_use
+      if (type === 'assistant' && msg.message?.content) {
+        for (const block of msg.message.content) {
+          if (block.type === 'tool_use' && block.name === 'Bash' && toolUseAt === null) {
+            toolUseAt = rel;
+            console.error(`\n[${rel}ms] Bash tool_use 出现，command=${JSON.stringify(block.input?.command)?.substring(0, 80)}`);
+          }
+        }
+      }
+
+      // user 里的 tool_result —— 关键：它何时出现、带多少内容
+      if (type === 'user') {
+        const cb = Array.isArray(msg.message?.content) ? msg.message.content : [];
+        for (const b of cb) {
+          if (b.type === 'tool_result') {
+            const content = typeof b.content === 'string' ? b.content
+              : Array.isArray(b.content) ? b.content.map((c: any) => (c.type === 'text' ? c.text : '')).join('') : '';
+            if (content.includes('tick-') && toolResultAt === null) {
+              toolResultAt = rel;
+              toolResultStdout = content.substring(0, 500);
+              toolResultLineCount = (content.match(/tick-\d+/g) || []).length;
+              console.error(`\n[${rel}ms] tool_result 出现，含 ${toolResultLineCount} 个 tick 行`);
+            }
+          }
+        }
+      }
+
+      // 关键探测：执行期间（tool_use 之后、tool_result 之前）是否有任何事件携带部分 stdout
+      if (toolUseAt !== null && toolResultAt === null) {
+        const rawStr = JSON.stringify(msg);
+        if (/tick-\d+/.test(rawStr)) {
+          sawIncrementalStdout = true;
+          const m = rawStr.match(/tick-\d+/g);
+          timeline.push({ rel, type, subtype: msg.subtype, eventType: msg.event?.type, ticks: m });
+          console.error(`\n[${rel}ms] ⚡ 执行期间出现 stdout 片段: ${m?.join(',')} （type=${type}/${msg.subtype || msg.event?.type}）`);
+        }
+        // 记录执行期间的 tool_progress（只带耗时不带内容）
+        if (type === 'tool_progress' || msg.subtype === 'task_progress') {
+          timeline.push({ rel, type, subtype: msg.subtype, elapsed: msg.elapsed_time_seconds });
+        }
+      }
+
+      events.push(captured);
+    }
+
+    const duration = Date.now() - t0;
+    const gap = (toolUseAt !== null && toolResultAt !== null) ? toolResultAt - toolUseAt : null;
+
+    console.error('\n══════ Y1-Y3 实测值（前台）══════');
+    console.error(`[Y1] tool_result 一次性带全部 stdout？ 行数=${toolResultLineCount}（命令产出 8 行）`);
+    console.error(`[Y2] 执行期间是否见到携带 stdout 的增量事件: ${sawIncrementalStdout}（false=非实时，输出仅在 tool_result 一次性出现）`);
+    console.error(`[Y3] tool_use→tool_result 间隔: ${gap}ms（命令约 16s；接近则证明阻塞到跑完才返回）`);
+    console.error(`[timeline] 执行期间携带内容/进度的事件: ${JSON.stringify(timeline)}`);
+    console.error(`[tool_result 内容前 500]: ${toolResultStdout}`);
+
+    writeFileSync(`${dir}/realtime-fg.json`, JSON.stringify({
+      toolUseAt, toolResultAt, gap, toolResultLineCount, sawIncrementalStdout, duration, timeline,
+    }, null, 2));
+
+    expect(events.length).toBeGreaterThan(0);
+    // 只做存在性断言，实时性结论靠上面的记录（researcher：断结构不断结论）
+    expect(toolUseAt).not.toBeNull();
+  }, 180000);
+
+  it('case-18b 后台: 每秒读 .output 看是否逐步增长', async () => {
+    const dir = createTimestampDir('tool-foreground-background/case-18b-bg-realtime');
+
+    const t0 = Date.now();
+    let outputFile: string | null = null;
+    let bgTaskId: string | null = null;
+    const fileSnapshots: any[] = []; // 每秒快照：{ t, exists, lineCount, ticks }
+
+    const env = { ...BASE_ENV, OTEL_LOG_RAW_API_BODIES: `file:${dir}` };
+    const sdkQuery = query({
+      prompt: `Use the Bash tool to run this command in the BACKGROUND (set run_in_background to true): ${SLOW_CMD}. Then tell me the background task id.`,
+      options: { env, includePartialMessages: true, persistSession: false, settingSources: [], effort: 'low', permissionMode: 'bypassPermissions' } as any,
+    });
+
+    // 每秒读 output_file
+    const poller = setInterval(() => {
+      const t = Date.now() - t0;
+      if (outputFile) {
+        const exists = existsSync(outputFile);
+        let lineCount = 0; let ticks: string[] = [];
+        if (exists) {
+          try {
+            const c = readFileSync(outputFile, 'utf-8');
+            ticks = c.match(/tick-\d+/g) || [];
+            lineCount = ticks.length;
+          } catch { /* 文件可能正被写，忽略 */ }
+        }
+        fileSnapshots.push({ t, exists, lineCount, lastTick: ticks[ticks.length - 1] ?? null });
+        console.error(`[poll t=${t}ms] output_file exists=${exists} tickLines=${lineCount} last=${ticks[ticks.length - 1] ?? '-'}`);
+      } else {
+        console.error(`[poll t=${t}ms] outputFile 尚未获得`);
+      }
+    }, 1000);
+
+    const events: CapturedSDKEvent[] = [];
+    let index = 0;
+    try {
+      for await (const message of sdkQuery) {
+        const msg = message as any;
+        const type = msg.type || 'unknown';
+        const rel = Date.now() - t0;
+        const captured: CapturedSDKEvent = { index: index++, type, timestamp: Date.now() };
+
+        // 从 tool_result 的 backgroundTaskId 或提示文本里取 output 路径
+        if (type === 'user') {
+          const cb = Array.isArray(msg.message?.content) ? msg.message.content : [];
+          for (const b of cb) {
+            if (b.type === 'tool_result') {
+              const content = typeof b.content === 'string' ? b.content
+                : Array.isArray(b.content) ? b.content.map((c: any) => (c.type === 'text' ? c.text : '')).join('') : '';
+              const fm = content.match(/written to:\s*([^\s"]+\.output)/i) || content.match(/([A-Za-z]:\\[^\s"]+\.output)/);
+              if (fm && !outputFile) {
+                outputFile = fm[1];
+                console.error(`\n[${rel}ms] 从 tool_result 提取 output_file: ${outputFile}`);
+              }
+              const im = content.match(/ID:\s*([A-Za-z0-9_-]+)/i);
+              if (im && !bgTaskId) bgTaskId = im[1];
+            }
+          }
+        }
+
+        if (type === 'system') {
+          captured.subtype = msg.subtype;
+          if (msg.subtype === 'task_started' && !bgTaskId) {
+            bgTaskId = msg.task_id;
+            console.error(`\n[${rel}ms] task_started task_id=${msg.task_id}`);
+          }
+          if (msg.subtype === 'task_notification') {
+            console.error(`\n[${rel}ms] task_notification status=${msg.status} output_file="${msg.output_file}"`);
+            if (msg.output_file && !outputFile) outputFile = msg.output_file;
+          }
+        }
+
+        events.push(captured);
+      }
+    } finally {
+      clearInterval(poller);
+    }
+
+    const duration = Date.now() - t0;
+
+    // 分析：文件行数是否随时间增长
+    const growthSteps = fileSnapshots.filter((s, i) => i === 0 || s.lineCount !== fileSnapshots[i - 1].lineCount);
+    const maxLines = Math.max(0, ...fileSnapshots.map(s => s.lineCount));
+    const grewOverTime = growthSteps.filter(s => s.exists).length > 1 && maxLines > 1;
+
+    console.error('\n══════ Z1-Z2 实测值（后台）══════');
+    console.error(`[Z1] output_file 路径: ${outputFile ?? '(未获得)'}`);
+    console.error(`[Z2] 文件行数是否随时间逐步增长: ${grewOverTime}（maxLines=${maxLines}）`);
+    console.error(`[增长阶梯]: ${JSON.stringify(growthSteps.map(s => ({ t: s.t, lines: s.lineCount, last: s.lastTick })))}`);
+
+    writeFileSync(`${dir}/realtime-bg.json`, JSON.stringify({
+      outputFile, bgTaskId, duration, maxLines, grewOverTime, fileSnapshots, growthSteps,
+    }, null, 2));
+
+    expect(events.length).toBeGreaterThan(0);
+  }, 180000);
 });

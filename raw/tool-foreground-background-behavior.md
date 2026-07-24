@@ -640,3 +640,52 @@ t+53936ms  全部结束
 5. **case-17**：等 task_started 后再调 → **true** → 真因确认：**必须在 task_started 之后调用**。
 
 **最终真相**：SDK 的控制方法（backgroundTasks/stopTask）操作的是「已注册的后台任务对象」，该对象在 `task_started` 事件发出时才存在。早于此调用，SDK 匹配不到任务 → 返回 false（backgroundTasks）或潜在失败。这与输入模式（string/streaming）、SDK 自动后台化、tool_use_id 匹配都无关，是纯粹的**事件时序依赖**。
+
+---
+
+## 前台/后台输出实时性专项（case-18）
+
+> 调研人：Claude Code
+> 日期：2026-07-24
+> 环境：同 case-14~17（LOCAL 网关 / `Jereh-LLM-NO-THINK-V1`）
+> 目的：拿确凿证据回答「前台任务输出能否实时拿到？后台任务输出能否实时拿到？」。此前对「前台一次性返回」的说法是从 case-1（echo 瞬时命令）过度推断——echo 太快无法区分实时/一次性。本 case 用【慢速多行】命令：`for i in $(seq 1 8); do echo tick-$i; sleep 2; done`（约 16s，分 8 次输出）。
+
+### 核心发现（前台不可实时、后台可实时）
+
+| # | 发现 | 证据 |
+|---|------|------|
+| 43 | **前台任务输出【不能】实时拿到**：stdout 在命令跑完后【一次性】随 tool_result 返回 | case-18a：`toolResultLineCount: 8`（一次性带全部 8 行）、`sawIncrementalStdout: false`、`timeline: []`（执行期 20s 内事件流无任何 stdout 片段） |
+| 44 | **前台 tool_result 阻塞到命令结束才出现** | case-18a：tool_use@7048ms → tool_result@26863ms，`gap: 19815ms` ≈ 命令执行时长 |
+| 45 | **前台执行期间无携带内容的事件**：官方 streaming 文档只流式 LLM 文本（text_delta）和工具入参（input_json_delta），【不流式】工具执行的 stdout | case-18a：`timeline: []`；`agent-sdk__streaming-output.md` 全文未提工具 stdout 流式 |
+| 46 | **后台任务输出【能】实时拿到**：stdout 持续写入 `.output` 文件，可 tail | case-18b：`grewOverTime: true`，文件行数随时间阶梯增长 |
+| 47 | **后台 `.output` 文件行数与命令产出节奏同步** | case-18b：t=11136ms→1 行(tick-1)、13153ms→2、15163ms→3、17193ms→4、19213ms→5，每 ~2s 增一行 |
+
+### case-18a 前台时间线
+
+```
+t+7048ms   Bash tool_use 出现（命令开始执行）
+t+7048ms ~ 26863ms  执行期 ~20s —— 事件流【完全空白】，无任何 tick-N 片段
+t+26863ms  tool_result 出现，一次性带全部 8 行 tick-1..tick-8
+```
+
+### case-18b 后台 .output 文件增长阶梯
+
+```
+output_file = ...tasks/b2p19vl33.output
+t+11136ms  1 行 (tick-1)
+t+13153ms  2 行 (tick-2)
+t+15163ms  3 行 (tick-3)
+t+17193ms  4 行 (tick-4)
+t+19213ms  5 行 (tick-5)   ← 每 ~2s 增一行，与命令产出同步
+```
+
+### 最终结论：输出实时性对照
+
+| 任务类型 | 能否实时拿输出 | 机制 | 证据 |
+|---------|--------------|------|------|
+| **前台任务** | **不能** | stdout 命令跑完后一次性随 tool_result 返回，执行期无增量事件 | case-18a：gap 19.8s、8 行一次性、增量为空 |
+| **后台任务** | **能** | stdout 持续写入 `.output` 文件，可按路径 tail | case-18b：文件行数每 2s 阶梯增长 tick-1→5 |
+
+**这也解释了 SDK 为何自动后台化长前台命令（case-12/13）**：前台阻塞模式下中间输出对用户完全不可见，转后台走 `.output` 文件通道反而获得实时可见性。
+
+**给 CodePilot 的建议**：需要向用户实时展示长命令输出时，应让命令走后台（`run_in_background:true`）并 tail 其 `output_file`；前台命令只能在结束时一次性拿到全部输出。
