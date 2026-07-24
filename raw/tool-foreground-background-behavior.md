@@ -522,6 +522,57 @@ query 结束:        57762ms  ← result subtype=success, terminal_reason=comple
 
 ### 仍未确定的点
 
-1. **turn 活跃窗口内 interrupt 能否成功**：本次 interrupt 因太晚而抛错，未观测到"成功打断一个正阻塞的 turn"。需在 tool_result 流回前的窗口同步调用验证。
-2. **stopTask(taskId) 的实际效果**：本 case 未测。理论上它能停自动后台化的任务（bashTaskId 已知），且不结束 query —— 比 interrupt 更适合"停单个后台任务"。
-3. **backgroundTasks 在任务被自动后台化【之前】的极窄窗口**（tool_use 出现到 ~5s 内）能否返回 true：本次 9290ms 调用仍偏晚，未穿透该窗口。
+1. ~~**turn 活跃窗口内 interrupt 能否成功**~~ —— **已验证（case-16）**：turn 活跃时同步 interrupt 成功，见下节。
+2. ~~**stopTask(taskId) 的实际效果**~~ —— **已验证（case-15）**：stopTask 成功停任务、发 stopped 通知、query 不死可续轮，见下节。
+3. **backgroundTasks 在任务被自动后台化【之前】的极窄窗口**（tool_use 出现到 ~5s 内）能否返回 true：case-14 的 9290ms 调用仍偏晚，未穿透该窗口。case-16 证明 7236ms 时 turn 仍活跃（taskStartedSeen=false），故该窗口 > 7s，但 backgroundTasks 在此窗口是否返回 true 仍未单测。
+
+---
+
+## stopTask + 同步 interrupt 专项实验（case-15 / case-16）
+
+> 调研人：Claude Code
+> 日期：2026-07-24
+> 环境：同 case-14（LOCAL 网关 / `Jereh-LLM-NO-THINK-V1`，streaming-input 模式）
+> 目的：回答 case-14 遗留的两个关键问题 —— (a) stopTask 能否停单个后台任务且保持 query？(b) turn 活跃时同步 interrupt 能否真正打断（而非 case-14 那样太晚抛错）？
+
+### case-15：stopTask 停单个后台任务（完整成功，最对口用户需求）
+
+拿到 `bashTaskId`（task_started）后立即 `stopTask(taskId)`。实测：
+
+| # | 发现 | 证据 |
+|---|------|------|
+| 26 | **stopTask() 调用成功，不抛错** | `stopCallResult: OK`（调用时机 12669ms） |
+| 27 | **发出 task_notification status=`stopped`**（非 completed） | `taskNotificationStatus: stopped`，仅在 stopTask 后 55ms（12669→12724）到达 |
+| 28 | **query 不结束，可 streaming 续轮** | `queryEnded` 直到 21176ms，`turnsObserved: 4`，`turn2Reached: true`，result subtype=success |
+| 29 | **sleep 40 被真正中断** | 总耗时 21176ms（对照 case-14 等满 40s 的 57762ms） |
+| 30 | **续轮里 AI 正确感知任务被停** | 第二轮回答："The background task was **stopped/aborted before it could complete**. The `sleep 40` command did not finish executing, so `bg-15-done` was never printed." |
+| 31 | **stopped 通知带真实 output_file 路径**（非 null） | `output_file: ...tasks/bto9trm4z.output`；但任务停止后文件很快被清理，事后（测试结束后）读不到，需在 query 存活期读 |
+
+**结论**：stopTask 是"停止阻塞后在同一会话继续问 AI"的**正确且唯一干净路径**。它精确停单个后台任务、立即回 stopped 通知、query 存活、支持续轮，AI 能感知任务已停。
+
+### case-16：turn 活跃窗口内同步 interrupt（成功，修正 case-14）
+
+拿到 `bashToolUseId` 后【在主循环里同步】调 `interrupt()`（而非 case-14 的 1Hz 观察者延迟触发）。实测：
+
+| # | 发现 | 证据 |
+|---|------|------|
+| 32 | **turn 活跃时 interrupt() 成功，不抛 "Query closed"** | `interruptCallResult: OK`（调用时机 7236ms） |
+| 33 | **interrupt 真正打断阻塞** | queryEndedAt=13515ms（对照 case-14 等满 sleep 的 57762ms） |
+| 34 | **interrupt 有效窗口 = tool_use 出现 → 自动后台化之前** | interrupt@7236ms 时 `taskStartedSeen: false`（尚未自动后台化）；case-14@15233ms 时 turn 已收尾故抛错 |
+| 35 | **result subtype=success, terminal_reason=completed**（无专门的 interrupted 标记） | 与 sdk.d.ts 一致：interrupt 不产生独立 subtype |
+| 36 | **interrupt 后仍能 streaming 续轮**（比文档"interrupt 结束 query"更微妙） | `turnsObserved: 2`，`turn2Yielded: true`，第二轮 AI 回答 "OK" |
+
+**结论**：interrupt 有一个**狭窄有效窗口**——必须在 tool_use 出现到 SDK 自动后台化（本环境 > 7s）之间同步调用。窗口内调用能真正打断前台阻塞；错过窗口（turn 收尾后）则抛 "Query closed before response received"。因此 interrupt 不能靠慢速轮询兜底，要在 turn 阻塞的第一时间同步触发。
+
+### 三方对照：backgroundTasks vs stopTask vs interrupt（streaming-input 模式）
+
+| 控制方法 | 调用结果 | 是否停/转任务 | query 是否存活 | 阻塞是否解除 | 适用场景 |
+|---------|---------|-------------|--------------|------------|---------|
+| `backgroundTasks(toolUseId)`（case-14） | **false** | 否（任务已自动后台化） | 存活 | 否（等满 sleep） | 本环境下对长任务无效 |
+| `stopTask(taskId)`（case-15） | **OK** | 是，任务→stopped | **存活，可续轮** | 是（21s vs 57s） | **停单个后台任务 + 继续会话（首选）** |
+| `interrupt()`（case-16，窗口内） | **OK** | 打断整个当前 turn | 结束当前 turn（但 streaming 可续轮） | 是（13.5s） | 打断正阻塞的 turn（TUI Esc），时机敏感 |
+
+**给 CodePilot 的最终建议**：
+- 要"停一个卡住的后台任务、会话继续"→ 用 **stopTask(taskId)**（taskId 从 task_started/task_notification 收集）。
+- 要"用户按 Esc 打断当前操作"→ 用 **interrupt()**，但必须在 turn 活跃时同步调用，不能延迟。
+- **不要用 backgroundTasks() 手动转后台长命令**——本环境返回 false，SDK 已自动后台化。
