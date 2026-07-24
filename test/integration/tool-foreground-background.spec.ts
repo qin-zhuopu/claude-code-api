@@ -32,17 +32,18 @@ dotenv.config();
 
 // ====== 公共配置 ======
 
-// 本地 LLM 配置（Jereh litellm 网关 + Kimi-K2.6）。
-// token 走环境变量，不入库；运行前 export ANTHROPIC_AUTH_TOKEN_LOCAL=sk-...
-// 如需切换模型/网关，改这里一处即可；case 内引用 BASE_ENV。
+// 本地 LLM 配置（LOCAL 网关 10.1.3.115:4000 + Jereh-LLM-NO-THINK-V1）。
+// token / base_url 全部走 .env 的 LOCAL__ 组，不硬编码任何密钥。
+// 由测试文件顶部 dotenv.config() 加载；.env 已 gitignore。
+// 如需切换网关，改这里引用的环境变量前缀即可（LOCAL__/JEREH__/BIGMODEL__）。
 const BASE_ENV = {
-  ANTHROPIC_AUTH_TOKEN: process.env.ANTHROPIC_AUTH_TOKEN_LOCAL,
-  ANTHROPIC_BASE_URL: 'https://litellm.jereh.cn',
-  ANTHROPIC_MODEL: 'Jereh-Kimi-K2.6',
-  CLAUDE_CODE_SUBAGENT_MODEL: 'Jereh-Kimi-K2.6',
-  ANTHROPIC_DEFAULT_OPUS_MODEL: 'Jereh-Kimi-K2.6',
-  ANTHROPIC_DEFAULT_SONNET_MODEL: 'Jereh-Kimi-K2.6',
-  ANTHROPIC_DEFAULT_HAIKU_MODEL: 'Jereh-Kimi-K2.6',
+  ANTHROPIC_AUTH_TOKEN: process.env.LOCAL__ANTHROPIC_AUTH_TOKEN,
+  ANTHROPIC_BASE_URL: process.env.LOCAL__ANTHROPIC_BASE_URL,
+  ANTHROPIC_MODEL: process.env.LOCAL__ANTHROPIC_MODEL,
+  CLAUDE_CODE_SUBAGENT_MODEL: process.env.LOCAL__CLAUDE_CODE_SUBAGENT_MODEL,
+  ANTHROPIC_DEFAULT_OPUS_MODEL: process.env.LOCAL__ANTHROPIC_DEFAULT_OPUS_MODEL,
+  ANTHROPIC_DEFAULT_SONNET_MODEL: process.env.LOCAL__ANTHROPIC_DEFAULT_SONNET_MODEL,
+  ANTHROPIC_DEFAULT_HAIKU_MODEL: process.env.LOCAL__ANTHROPIC_DEFAULT_HAIKU_MODEL,
   CLAUDE_CODE_WORKFLOWS: '1',
   CLAUDE_CODE_USE_POWERSHELL_TOOL: '1',
   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
@@ -1481,4 +1482,415 @@ describe('backgroundTasks() 前台转后台机制', () => {
     //     （sleep 40 + LLM 两轮开销，总耗时远超单次 sleep）
     expect(duration).toBeGreaterThan(40000);
   }, 180000);
+});
+
+// ====== streaming-input 模式下主动后台化 + 多轮观察（case-14）======
+//
+// 缘起：case-13（string-prompt 模式）调 backgroundTasks() 始终返回 false。
+// SDK 类型定义 sdk.d.ts:2229-2230 明确：所有控制方法（interrupt/backgroundTasks/
+// stopTask/streamInput）【只在 streaming input/output 模式下支持】。
+// case-13 用的是 prompt:string（单次模式）→ 控制方法可能根本没生效。
+//
+// 本 case 用 streaming-input 模式（prompt 传 AsyncIterable<SDKUserMessage>）重验，
+// 并完整走通：前台长 Bash → 主动 backgroundTasks 转后台 → 确认转后台成功 →
+// （若仍阻塞）interrupt 兜底 → streaming 续轮问 AI 任务情况 → task_notification 唤醒。
+//
+// 架构：单进程 3 协程 + 闭包共享 state（Node 单线程串行，无锁）
+//   promptInput generator ──yield msg1──▶ for-await 主循环（捕获 toolUseId/调控制方法）
+//         ▲ resolve turn2Gate（转后台成功放行 msg2）      │ 读写 state
+//         └──────────────────────────────────────────────┤
+//                                          setInterval 1Hz 观察者（快照 + interrupt 兜底）
+//
+// 实验未知（只记录，不预先断言）：
+//   U1 streaming 模式下 backgroundTasks 返回 true 还是 false？
+//   U2 转后台主信号：task_updated.is_backgrounded vs tool_result.backgroundTaskId？
+//   U3 interrupt 后 for-await 是结束（query 死）还是能续轮？
+//   U4 task_notification 唤醒时 query 已结束还是仍阻塞？
+//   U5 SDK ~30s 自动后台化是否抢先？
+
+describe('backgroundTasks() streaming-input 模式', () => {
+  const LONG_CMD_14 = 'sleep 40 && echo bg-14-done';
+
+  type Phase =
+    | 'init' | 'awaiting_tool_use' | 'backgrounding' | 'backgrounded'
+    | 'turn2_streaming' | 'interrupting' | 'task_completed' | 'query_ended';
+
+  interface Case14State {
+    phase: Phase;
+    phaseEnteredAt: Record<string, number>;
+    queryStartedAt: number;
+    bashToolUseId: string | null;
+    bashTaskId: string | null;
+    backgroundCallResult: boolean | 'NOT_CALLED' | 'NO_METHOD' | string;
+    backgroundCallAt: number | null;
+    interruptCallResult: 'NOT_CALLED' | 'OK' | string;
+    interruptCallAt: number | null;
+    backgroundedViaTaskUpdated: boolean;
+    backgroundTaskIdFromResult: string | null;
+    taskNotificationReceived: boolean;
+    taskNotificationStatus: string | null;
+    outputFile: string | null;
+    outputFileReadable: boolean | null;
+    outputFileContentSnippet: string | null;
+    queryEnded: boolean;
+    queryEndedAt: number | null;
+    resultSubtype: string | null;
+    terminalReason: string | null;
+    eventCount: number;
+    turnsObserved: number;
+  }
+
+  interface ObserverTick {
+    t: number;
+    phase: Phase;
+    queryEnded: boolean;
+    eventCount: number;
+    bashToolUseIdKnown: boolean;
+    backgroundCallResult: Case14State['backgroundCallResult'];
+    backgroundedViaTaskUpdated: boolean;
+    interruptCallResult: string;
+    taskNotificationReceived: boolean;
+    taskNotificationStatus: string | null;
+    outputFile: string | null;
+    outputFileReadable: boolean | null;
+  }
+
+  it('case-14 streaming-input: 主动 backgroundTasks 转后台 + interrupt 兜底 + 续轮', async () => {
+    const dir = createTimestampDir('tool-foreground-background/case-14-streaming-input-bg');
+
+    // ── 共享状态 ──
+    const state: Case14State = {
+      phase: 'init',
+      phaseEnteredAt: { init: 0 },
+      queryStartedAt: Date.now(),
+      bashToolUseId: null,
+      bashTaskId: null,
+      backgroundCallResult: 'NOT_CALLED',
+      backgroundCallAt: null,
+      interruptCallResult: 'NOT_CALLED',
+      interruptCallAt: null,
+      backgroundedViaTaskUpdated: false,
+      backgroundTaskIdFromResult: null,
+      taskNotificationReceived: false,
+      taskNotificationStatus: null,
+      outputFile: null,
+      outputFileReadable: null,
+      outputFileContentSnippet: null,
+      queryEnded: false,
+      queryEndedAt: null,
+      resultSubtype: null,
+      terminalReason: null,
+      eventCount: 0,
+      turnsObserved: 0,
+    };
+
+    const transitionPhase = (next: Phase) => {
+      if (state.phase !== next) {
+        state.phase = next;
+        state.phaseEnteredAt[next] = Date.now() - state.queryStartedAt;
+        console.error(`\n[phase] → ${next} @ ${state.phaseEnteredAt[next]}ms`);
+      }
+    };
+
+    const events: CapturedSDKEvent[] = [];
+    const observerLog: ObserverTick[] = [];
+
+    // ── streaming-input generator（deferred-promise 外部驱动 + 15s 安全阀）──
+    let resolveTurn2: () => void = () => {};
+    const turn2Gate = new Promise<void>((r) => { resolveTurn2 = r; });
+    const turn2Timeout = new Promise<void>((r) => setTimeout(r, 15000));
+
+    const msg1: any = {
+      type: 'user',
+      message: {
+        role: 'user',
+        content: `Use the Bash tool to run this exact command: ${LONG_CMD_14}. Run it in the foreground. Do NOT set run_in_background.`,
+      },
+      parent_tool_use_id: null,
+    };
+    const msg2: any = {
+      type: 'user',
+      message: {
+        role: 'user',
+        content: 'What is the current status of the background task you started earlier? Just report its status. Do NOT run any new commands.',
+      },
+      parent_tool_use_id: null,
+      priority: 'now',
+    };
+
+    async function* promptInput(): AsyncIterable<any> {
+      yield msg1;
+      // 阻塞到「转后台成功」或 15s 安全阀
+      await Promise.race([turn2Gate, turn2Timeout]);
+      console.error(`\n[gen] turn2 gate 放行 @ ${Date.now() - state.queryStartedAt}ms，yield msg2`);
+      yield msg2;
+    }
+
+    const env = { ...BASE_ENV, OTEL_LOG_RAW_API_BODIES: `file:${dir}` };
+    const queryOptions: any = {
+      env,
+      includePartialMessages: true,
+      persistSession: false,
+      settingSources: [],
+      effort: 'low',
+      permissionMode: 'bypassPermissions',
+    };
+
+    const sdkQuery = query({ prompt: promptInput(), options: queryOptions });
+    const queryHandle: any = sdkQuery;
+
+    // ── setInterval 1Hz 观察者（快照 + 首次读 output_file + interrupt 兜底）──
+    let isInterrupting = false;
+    const observer = setInterval(() => {
+      const t = Date.now() - state.queryStartedAt;
+      // 首次拿到 output_file 时尝试读
+      if (state.outputFile && state.outputFileReadable === null) {
+        try {
+          const c = readFileSync(state.outputFile, 'utf-8');
+          state.outputFileContentSnippet = c.substring(0, 500);
+          state.outputFileReadable = true;
+        } catch {
+          state.outputFileReadable = false;
+        }
+      }
+
+      observerLog.push({
+        t,
+        phase: state.phase,
+        queryEnded: state.queryEnded,
+        eventCount: state.eventCount,
+        bashToolUseIdKnown: !!state.bashToolUseId,
+        backgroundCallResult: state.backgroundCallResult,
+        backgroundedViaTaskUpdated: state.backgroundedViaTaskUpdated,
+        interruptCallResult: state.interruptCallResult,
+        taskNotificationReceived: state.taskNotificationReceived,
+        taskNotificationStatus: state.taskNotificationStatus,
+        outputFile: state.outputFile,
+        outputFileReadable: state.outputFileReadable,
+      });
+      console.error(`[obs t=${t}ms] phase=${state.phase} ended=${state.queryEnded} ev=${state.eventCount} bgCall=${state.backgroundCallResult} bgd=${state.backgroundedViaTaskUpdated} intr=${state.interruptCallResult} notif=${state.taskNotificationStatus ?? '-'}`);
+
+      // ── interrupt 兜底决策（唯一能在主循环阻塞时执行的位置）──
+      // 条件：已尝试转后台但未成功、query 未结束、interrupt 未调过、距 bgCall > 5s
+      if (
+        !isInterrupting &&
+        state.backgroundCallResult !== 'NOT_CALLED' &&
+        !state.backgroundedViaTaskUpdated &&
+        state.backgroundCallResult !== true &&
+        !state.queryEnded &&
+        state.interruptCallResult === 'NOT_CALLED' &&
+        state.backgroundCallAt !== null &&
+        t - state.backgroundCallAt > 5000
+      ) {
+        isInterrupting = true;
+        transitionPhase('interrupting');
+        state.interruptCallAt = t;
+        console.error(`\n[interrupt] 转后台 ${t - state.backgroundCallAt}ms 无 is_backgrounded 信号，触发 interrupt 兜底`);
+        (async () => {
+          try {
+            if (typeof queryHandle.interrupt === 'function') {
+              await queryHandle.interrupt();
+              state.interruptCallResult = 'OK';
+            } else {
+              state.interruptCallResult = 'NO_METHOD';
+            }
+          } catch (e: any) {
+            state.interruptCallResult = `ERROR: ${e?.message || e}`;
+          }
+          console.error(`[interrupt] 结果: ${state.interruptCallResult}`);
+          // interrupt 后也放行第二轮（尝试续轮）
+          resolveTurn2();
+        })();
+      }
+    }, 1000);
+
+    // ── for-await 主循环 ──
+    let index = 0;
+    try {
+      for await (const message of sdkQuery) {
+        const msg = message as any;
+        const type = msg.type || 'unknown';
+        const captured: CapturedSDKEvent = { index: index++, type, timestamp: Date.now() };
+        state.eventCount = index;
+
+        if (type === 'stream_event' && msg.event) {
+          const evt = msg.event;
+          captured.eventType = evt.type;
+          if (evt.type === 'content_block_start' && evt.content_block?.type === 'tool_use') {
+            captured.toolName = evt.content_block.name;
+            captured.toolUseId = evt.content_block.id;
+          }
+          if (evt.type === 'content_block_delta' && evt.delta?.type === 'input_json_delta') {
+            captured.deltaType = 'input_json_delta';
+            captured.inputJsonSnippet = evt.delta.partial_json;
+          }
+        }
+
+        if (type === 'system') {
+          captured.subtype = msg.subtype;
+          if (msg.subtype === 'task_started') {
+            captured.taskId = msg.task_id;
+            captured.taskType = msg.task_type;
+            captured.raw = { ...msg };
+            if (!state.bashTaskId) {
+              state.bashTaskId = msg.task_id;
+              console.error(`\n[task_started] task_id=${msg.task_id} type=${msg.task_type}`);
+            }
+          }
+          if (msg.subtype === 'task_updated') {
+            captured.taskId = msg.task_id;
+            captured.raw = { patch: msg.patch };
+            console.error(`\n[task_updated] task_id=${msg.task_id} patch=${JSON.stringify(msg.patch)}`);
+            if (msg.patch?.is_backgrounded === true) {
+              state.backgroundedViaTaskUpdated = true;
+              transitionPhase('backgrounded');
+            }
+          }
+          if (msg.subtype === 'task_notification') {
+            captured.taskId = msg.task_id;
+            captured.taskStatus = msg.status;
+            captured.taskType = msg.task_type;
+            captured.raw = {
+              task_id: msg.task_id, status: msg.status, summary: msg.summary,
+              error: msg.error, output_file: msg.output_file, task_type: msg.task_type,
+              usage: msg.usage, tool_use_id: msg.tool_use_id,
+            };
+            state.taskNotificationReceived = true;
+            state.taskNotificationStatus = msg.status;
+            if (msg.output_file) state.outputFile = msg.output_file;
+            transitionPhase('task_completed');
+            console.error(`\n[task_notification] status=${msg.status} output_file="${msg.output_file}" (query已结束=${state.queryEnded})`);
+          }
+        }
+
+        if (type === 'assistant' && msg.message?.content) {
+          state.turnsObserved++;
+          for (const block of msg.message.content) {
+            if (block.type === 'tool_use') {
+              captured.toolName = block.name;
+              captured.toolUseId = block.id;
+              if (block.name === 'Bash' && !state.bashToolUseId) {
+                state.bashToolUseId = block.id;
+                transitionPhase('awaiting_tool_use');
+                console.error(`\n[assistant] 捕获 Bash toolUseId=${block.id}`);
+              }
+              if (!captured.raw) captured.raw = {};
+              captured.raw.toolInput = block.input;
+            }
+          }
+        }
+
+        if (type === 'user') {
+          const contentBlocks = Array.isArray(msg.message?.content) ? msg.message.content : [];
+          for (const b of contentBlocks) {
+            if (b.type === 'tool_result') {
+              const snippet = typeof b.content === 'string'
+                ? b.content
+                : Array.isArray(b.content)
+                  ? b.content.map((c: any) => (c.type === 'text' ? c.text : '')).join('')
+                  : '';
+              captured.raw = { tool_use_id: b.tool_use_id, contentSnippet: snippet.substring(0, 1000) };
+              const m = snippet.match(/backgroundTaskId["']?\s*[:=]\s*["']?([A-Za-z0-9_-]+)/i)
+                || snippet.match(/ID:\s*([A-Za-z0-9_-]+)/i);
+              if (m && !state.backgroundTaskIdFromResult) state.backgroundTaskIdFromResult = m[1];
+            }
+          }
+        }
+
+        if (type === 'result') {
+          captured.raw = { subtype: msg.subtype, num_turns: msg.num_turns, terminal_reason: msg.terminal_reason };
+          state.queryEnded = true;
+          state.queryEndedAt = Date.now() - state.queryStartedAt;
+          state.resultSubtype = msg.subtype;
+          state.terminalReason = msg.terminal_reason ?? null;
+          console.error(`\n[result] subtype=${msg.subtype} num_turns=${msg.num_turns} terminal_reason=${msg.terminal_reason ?? '-'} @ ${state.queryEndedAt}ms`);
+        }
+
+        events.push(captured);
+
+        // 打印 text_delta
+        if (type === 'stream_event' && msg.event?.type === 'content_block_delta' && msg.event.delta?.type === 'text_delta') {
+          process.stderr.write(msg.event.delta.text);
+        }
+
+        // ── 控制调用 #1：拿到 bashToolUseId 立刻转后台 ──
+        if (state.bashToolUseId && state.backgroundCallResult === 'NOT_CALLED') {
+          transitionPhase('backgrounding');
+          state.backgroundCallAt = Date.now() - state.queryStartedAt;
+          console.error(`\n[backgroundTasks] 调用 @ ${state.backgroundCallAt}ms，toolUseId=${state.bashToolUseId}`);
+          try {
+            state.backgroundCallResult = typeof queryHandle.backgroundTasks === 'function'
+              ? await queryHandle.backgroundTasks(state.bashToolUseId)
+              : 'NO_METHOD';
+          } catch (e: any) {
+            state.backgroundCallResult = `ERROR: ${e?.message || e}`;
+          }
+          console.error(`[backgroundTasks] 返回: ${state.backgroundCallResult}`);
+        }
+
+        // ── 控制调用 #2：转后台成功 → 放行第二轮 ──
+        if (
+          (state.backgroundedViaTaskUpdated || state.backgroundCallResult === true) &&
+          state.phase !== 'turn2_streaming' &&
+          state.phase !== 'task_completed'
+        ) {
+          transitionPhase('turn2_streaming');
+          console.error(`\n[turn2] 转后台成功，放行第二轮`);
+          resolveTurn2();
+        }
+      }
+    } finally {
+      clearInterval(observer);
+    }
+
+    const duration = Date.now() - state.queryStartedAt;
+    if (!state.queryEnded) state.queryEndedAt = duration;
+
+    // ── 输出分析 ──
+    printTimeline('Case 14: streaming-input 主动后台化', events, duration);
+    const taskAnalysis = analyzeTaskEvents(events);
+
+    console.error('\n══════ U1-U5 实测值 ══════');
+    console.error(`[U1] streaming 模式下 backgroundTasks 返回: ${state.backgroundCallResult}（调用时机 ${state.backgroundCallAt}ms）`);
+    console.error(`[U2] 转后台信号: task_updated.is_backgrounded=${state.backgroundedViaTaskUpdated}, tool_result.backgroundTaskId=${state.backgroundTaskIdFromResult}, task_started.task_id=${state.bashTaskId}`);
+    console.error(`[U3] interrupt: ${state.interruptCallResult}（时机 ${state.interruptCallAt}ms）; turnsObserved=${state.turnsObserved}; result.subtype=${state.resultSubtype}; terminal_reason=${state.terminalReason}`);
+    console.error(`[U4] task_notification: received=${state.taskNotificationReceived} status=${state.taskNotificationStatus}; 到达时 query已结束=${state.queryEnded && state.taskNotificationReceived}; output_file="${state.outputFile}" readable=${state.outputFileReadable}`);
+    console.error(`[U5] 自动后台化抢先判断: bgCall@${state.backgroundCallAt}ms, backgrounded phase@${state.phaseEnteredAt['backgrounded'] ?? '-'}ms`);
+    console.error(`[phase timeline] ${JSON.stringify(state.phaseEnteredAt)}`);
+    console.error(`[输出文件内容] ${state.outputFileContentSnippet ?? '(未读到)'}`);
+
+    // ── 落盘 ──
+    writeFileSync(`${dir}/sdk-events.json`, JSON.stringify(events, null, 2));
+    writeFileSync(`${dir}/observer-log.json`, JSON.stringify(observerLog, null, 2));
+    writeFileSync(`${dir}/state-final.json`, JSON.stringify(state, null, 2));
+    writeFileSync(`${dir}/control-calls.json`, JSON.stringify({
+      backgroundCallResult: state.backgroundCallResult,
+      backgroundCallAt: state.backgroundCallAt,
+      interruptCallResult: state.interruptCallResult,
+      interruptCallAt: state.interruptCallAt,
+      backgroundedViaTaskUpdated: state.backgroundedViaTaskUpdated,
+      backgroundTaskIdFromResult: state.backgroundTaskIdFromResult,
+      bashTaskId: state.bashTaskId,
+      phaseTimeline: state.phaseEnteredAt,
+      resultSubtype: state.resultSubtype,
+      terminalReason: state.terminalReason,
+      turnsObserved: state.turnsObserved,
+      duration,
+    }, null, 2));
+
+    // ── 断言 ──
+    // 硬断言（机制必成立）
+    expect(events.length).toBeGreaterThan(0);
+    // backgroundTasks 方法存在且被调用（不是没调、不是没方法、不是抛错）
+    expect(state.backgroundCallResult).not.toBe('NOT_CALLED');
+    expect(state.backgroundCallResult).not.toBe('NO_METHOD');
+    expect(typeof state.backgroundCallResult).not.toBe('string'); // 非 ERROR:xxx，即返回了 boolean
+
+    // 软断言（记录，不 fatal）
+    try {
+      expect(taskAnalysis.taskStartedCount + taskAnalysis.taskNotificationCount).toBeGreaterThanOrEqual(1);
+    } catch {
+      console.error('[软断言] 未观察到 task_started/task_notification —— 记录为否定发现');
+    }
+  }, 240000);
 });

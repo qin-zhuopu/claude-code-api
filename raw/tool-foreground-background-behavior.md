@@ -465,3 +465,63 @@ SDK 注释（`sdk.d.ts:2496`）说返回 `false` 仅当「给了 toolUseId 但�
 6. **SSE cases (9-11)** — NestJS 服务端 SSE 传输的 task 消息包装格式未验证
 7. **`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` 的真实影响范围** — 需要更精确的控制变量实验
 8. **长运行后台任务的 task_notification completed 状态** — case-2 因超时未等到 completed；case-12/13 已观测到 completed（但 output_file 为空）
+
+---
+
+## streaming-input 模式专项实验（case-14）
+
+> 调研人：Claude Code
+> 日期：2026-07-24
+> 环境：SDK `@anthropic-ai/claude-agent-sdk` + 本地 LLM（LOCAL 网关 `10.1.3.115:4000` / `Jereh-LLM-NO-THINK-V1`），`permissionMode: bypassPermissions`，`settingSources: []`，`effort: low`
+> 目的：验证 case-13 遗留假设 —— 「backgroundTasks() 返回 false 是不是因为用了 string-prompt（单次）模式？」。SDK 类型注释（`sdk.d.ts:2229-2230`）明确：**控制方法（interrupt/backgroundTasks/stopTask/streamInput）只在 streaming input/output 模式下支持**。
+
+### 实验设计
+
+用 **streaming-input 模式**（`prompt` 传 `AsyncIterable<SDKUserMessage>` 而非 string）重跑 case-13 链路，并走通用户完整需求：前台长 Bash → 主动 `backgroundTasks(toolUseId)` 转后台 → 确认转后台 → （若仍阻塞）`interrupt()` 兜底 → streaming 续轮问 AI 任务情况 → task_notification 唤醒。
+
+架构：**单进程 3 协程 + 闭包共享 state**（Node 单线程串行，无锁）：
+- `promptInput` async generator（deferred-promise 外部驱动 + 15s 超时安全阀）：先 yield msg1（跑 Bash），await turn2Gate 后 yield msg2（问状态）。
+- for-await 主循环：捕获 toolUseId、调控制方法、收集事件。
+- `setInterval` 1Hz 观察者：每秒快照 + 首次读 output_file + **interrupt 兜底决策**（唯一能在主循环阻塞时执行的位置）。
+
+### 核心发现（大部分推翻原假设）
+
+| # | 发现 | 证据（case-14 实测） |
+|---|------|---------------------|
+| 19 | **streaming-input 模式下 `backgroundTasks()` 仍返回 `false`** —— 推翻「string-prompt 模式是 false 主因」的假设 | `backgroundCallResult: false`（调用时机 9290ms，即 Bash tool_use 一出现就调） |
+| 20 | **控制方法在 streaming 模式下确实被派发**（不是没生效）—— 但 backgroundTasks 语义上就是没匹配到可转的前台任务 | interrupt 被真实派发并返回业务错误（见发现 21），证明控制通道通了 |
+| 21 | **`interrupt()` 抛错 `Query closed before response received`** —— 调用时当前 turn 已结束，无 turn 可打断 | `interruptCallResult: "ERROR: Query closed before response received"`（15233ms 调用） |
+| 22 | **turn 之间有空隙**：Bash tool_use（9290ms）→ backgroundTasks 返回后 tool_result 流回、turn 收尾 → 观察者 6s 后（15233ms）再 interrupt 已太晚 | phaseTimeline: backgrounding@9290 → interrupting@15233；期间 turn 已结束 |
+| 23 | **streaming 续轮成功**：尽管 interrupt 抛错，msg2 仍成功流出并完成第二轮问答 | `turnsObserved: 2`，`resultSubtype: success`，`num_turns: 2`，LLM 回答「任务已完成，输出 bg-14-done」 |
+| 24 | **output_file 为 `null`**（连空字符串都不是）—— 自动后台化的任务，notification 不给输出路径 | `taskNotificationStatus: completed` 但 `outputFile: null`；输出只在更早的 tool_result.stdout 一次性拿到 |
+| 25 | **task_notification 到达时 query 尚未结束**：notification@52432ms，query 结束@57762ms —— 但输出早已在 tool_result 拿到，notification 只是终结信号 | phaseTimeline: task_completed@52432 vs queryEndedAt@57762 |
+
+### 关键时间线（case-14）
+
+```
+init:              0ms
+awaiting_tool_use: 9290ms   ← LLM 发出 Bash tool_use（toolUseId=call_c69a...，taskId=bzhtkxe7p）
+backgrounding:     9290ms   ← 立刻调 backgroundTasks(toolUseId) → 返回 false
+interrupting:      15233ms  ← 观察者 6s 后触发 interrupt 兜底 → 抛 "Query closed before response received"
+（msg2 经 turn2Gate 放行，第二轮问答进行）
+task_completed:    52432ms  ← task_notification status=completed，output_file=null
+query 结束:        57762ms  ← result subtype=success, terminal_reason=completed, num_turns=2
+```
+
+### 结论：case-13 的 false 是真实行为，与输入模式无关
+
+- **streaming-input 不是 backgroundTasks 生效的充分条件**。真正原因（沿用 case-12/13 结论）：长前台 Bash 被 SDK 在执行 ~5s 后**自动后台化**，等调用方拿到 toolUseId（本次 9290ms）时，任务已不是"可手动转后台的前台任务"，故 backgroundTasks 返回 false。
+- **`interrupt()` 只在 turn 活跃时有效**。streaming 模式下 turn 收尾很快（tool_result 流回即结束），事后再 interrupt 会抛 "Query closed"。若要用 interrupt 打断阻塞，必须在 turn 仍在等工具结果的窗口内同步调用，不能靠 1Hz 轮询的观察者（太慢）。
+- **续轮（多轮问答）在 streaming-input 下可行**：generator yield 新 SDKUserMessage 即开新 turn，同一 query 的 for-await 继续吐事件（turnsObserved=2 证实）。这是"消除阻塞后继续问 AI"的正确实现路径 —— 但不依赖 interrupt，而是靠 generator 续推消息。
+
+### 对调用方（CodePilot）的实际影响（补充 case-13 建议）
+
+1. **不要指望 backgroundTasks() 能手动转后台长任务** —— 无论 string 还是 streaming 模式都返回 false。要"长命令后台不阻塞 + 边跑边读"，唯一可靠路径仍是让 LLM 主动传 `run_in_background:true`（case-2）。
+2. **多轮对话用 streaming-input（generator 续推 SDKUserMessage）**，不要用 interrupt 续命 —— interrupt 会结束 query 且对已收尾的 turn 抛错。
+3. **interrupt 的正确用途**：在 turn 正阻塞等长工具时同步打断（TUI Esc 场景）。用轮询观察者做兜底 interrupt 不可靠（会错过 turn 活跃窗口）。
+
+### 仍未确定的点
+
+1. **turn 活跃窗口内 interrupt 能否成功**：本次 interrupt 因太晚而抛错，未观测到"成功打断一个正阻塞的 turn"。需在 tool_result 流回前的窗口同步调用验证。
+2. **stopTask(taskId) 的实际效果**：本 case 未测。理论上它能停自动后台化的任务（bashTaskId 已知），且不结束 query —— 比 interrupt 更适合"停单个后台任务"。
+3. **backgroundTasks 在任务被自动后台化【之前】的极窄窗口**（tool_use 出现到 ~5s 内）能否返回 true：本次 9290ms 调用仍偏晚，未穿透该窗口。
