@@ -2716,3 +2716,144 @@ describe('前台/后台输出实时性', () => {
     expect(events.length).toBeGreaterThan(0);
   }, 180000);
 });
+
+// ====== 前台命令的 .output 文件通道验证（case-19，解释 TUI Ctrl+O）======
+//
+// 缘起：case-18a 证明【前台】命令输出无法从 SDK 事件流实时拿到。但 TUI 里 Ctrl+O
+// （toggleTranscript）能看到前台命令的实时执行输出。假设：TUI 的实时可见性【不是】
+// 来自 SDK 事件流，而是来自「长前台命令被自动后台化后写入的 .output 文件」——
+// case-12/13 证明长前台命令会被 SDK 在 ~5s 后自动后台化并产生 task_started。
+//
+// 本 case 前台跑慢命令，同时监控三条通道：
+//   R1 SDK 事件流是否有增量 stdout？（预期否，同 case-18a）
+//   R2 前台命令是否被自动后台化并产生 task_started（拿到 task_id）？
+//   R3 用 task_id 拼出 .output 路径，该文件是否存在并【实时增长】？
+//       路径格式（case-14 已知）：{tmp}/claude/{sanitized-cwd}/{session_id}/tasks/{task_id}.output
+//       session_id 从 system/init 或 task_started 消息取。
+//
+// 结论指向：若 R3 成立，则 TUI Ctrl+O 的实时输出走的是【自动后台化后的 .output 文件】
+// 通道，而非 SDK 事件流——这就调和了「case-18a 说前台不可实时」与「Ctrl+O 能看到」。
+
+describe('前台命令 .output 文件通道', () => {
+  const SLOW_CMD_19 = 'for i in $(seq 1 10); do echo tick-$i; sleep 2; done'; // ~20s，10 行
+
+  it('case-19 前台命令是否有可实时读的 .output 文件', async () => {
+    const dir = createTimestampDir('tool-foreground-background/case-19-fg-output-file');
+
+    const t0 = Date.now();
+    let sessionId: string | null = null;
+    let bashTaskId: string | null = null;
+    let taskStartedAt: number | null = null;
+    let notifOutputFile: string | null = null;      // task_notification 给的 output_file
+    let sawIncrementalStdout = false;                // SDK 事件流是否有增量 stdout
+    let candidatePath: string | null = null;         // 用 task_id 拼的路径
+    const fileSnapshots: any[] = [];
+
+    const env = { ...BASE_ENV, OTEL_LOG_RAW_API_BODIES: `file:${dir}` };
+    const sdkQuery = query({
+      prompt: `Use the Bash tool to run this exact command in the FOREGROUND (do NOT set run_in_background): ${SLOW_CMD_19}. Then report how many lines printed.`,
+      options: { env, includePartialMessages: true, persistSession: false, settingSources: [], effort: 'low', permissionMode: 'bypassPermissions' } as any,
+    });
+
+    // 拼 .output 路径的辅助：优先用 notif 给的，其次用 task_id 拼
+    const resolveOutputPath = (): string | null => {
+      if (notifOutputFile) return notifOutputFile;
+      if (candidatePath) return candidatePath;
+      return null;
+    };
+
+    // 每秒尝试读候选文件
+    const poller = setInterval(() => {
+      const t = Date.now() - t0;
+      const p = resolveOutputPath();
+      if (p) {
+        const exists = existsSync(p);
+        let lineCount = 0; let ticks: string[] = [];
+        if (exists) {
+          try { const c = readFileSync(p, 'utf-8'); ticks = c.match(/tick-\d+/g) || []; lineCount = ticks.length; } catch {}
+        }
+        fileSnapshots.push({ t, path: p, exists, lineCount, last: ticks[ticks.length - 1] ?? null });
+        console.error(`[poll t=${t}ms] path=...${p.slice(-30)} exists=${exists} lines=${lineCount} last=${ticks[ticks.length - 1] ?? '-'}`);
+      } else {
+        console.error(`[poll t=${t}ms] 尚无候选 .output 路径（sessionId=${sessionId?'有':'无'} taskId=${bashTaskId?'有':'无'}）`);
+      }
+    }, 1000);
+
+    const events: CapturedSDKEvent[] = [];
+    let index = 0;
+    try {
+      for await (const message of sdkQuery) {
+        const msg = message as any;
+        const type = msg.type || 'unknown';
+        const rel = Date.now() - t0;
+        const captured: CapturedSDKEvent = { index: index++, type, timestamp: Date.now() };
+
+        // session_id 从任意带该字段的消息取
+        if (!sessionId && msg.session_id) {
+          sessionId = msg.session_id;
+          console.error(`\n[${rel}ms] sessionId=${sessionId}`);
+        }
+
+        if (type === 'system') {
+          captured.subtype = msg.subtype;
+          if (msg.subtype === 'task_started' && !bashTaskId) {
+            bashTaskId = msg.task_id;
+            taskStartedAt = rel;
+            if (msg.session_id) sessionId = msg.session_id;
+            console.error(`\n[${rel}ms] task_started（前台命令被自动后台化）task_id=${msg.task_id}`);
+            // 用 case-14 已知路径格式拼候选路径
+            if (sessionId && bashTaskId) {
+              const cwd = process.cwd();
+              const sanitized = cwd.replace(/[:\\/.]/g, '-');
+              const tmp = process.env.TEMP || process.env.TMP || 'C:\\Users\\14409~1.JER\\AppData\\Local\\Temp';
+              candidatePath = `${tmp}\\claude\\${sanitized}\\${sessionId}\\tasks\\${bashTaskId}.output`;
+              console.error(`[${rel}ms] 拼出候选 .output 路径: ${candidatePath}`);
+            }
+          }
+          if (msg.subtype === 'task_notification') {
+            console.error(`\n[${rel}ms] task_notification status=${msg.status} output_file="${msg.output_file}"`);
+            if (msg.output_file) notifOutputFile = msg.output_file;
+          }
+        }
+
+        // SDK 事件流是否有增量 stdout（tool_result 之前出现 tick-N）
+        if (bashTaskId || type === 'assistant') {
+          const rawStr = JSON.stringify(msg);
+          if (type !== 'user' && /tick-\d+/.test(rawStr)) {
+            // 排除 tool_result（那是最终一次性结果）
+            if (!(type === 'user')) {
+              sawIncrementalStdout = true;
+              console.error(`\n[${rel}ms] ⚡ SDK 事件流出现 stdout 片段（type=${type}/${msg.subtype || msg.event?.type}）`);
+            }
+          }
+        }
+
+        events.push(captured);
+      }
+    } finally {
+      clearInterval(poller);
+    }
+
+    const duration = Date.now() - t0;
+    const maxLines = Math.max(0, ...fileSnapshots.map(s => s.lineCount));
+    const existedSnapshots = fileSnapshots.filter(s => s.exists);
+    const growthSteps = existedSnapshots.filter((s, i) => i === 0 || s.lineCount !== existedSnapshots[i - 1].lineCount);
+    const fileGrewOverTime = growthSteps.length > 1 && maxLines > 1;
+
+    console.error('\n══════ R1-R3 实测值 ══════');
+    console.error(`[R1] SDK 事件流有增量 stdout: ${sawIncrementalStdout}（预期 false，同 case-18a）`);
+    console.error(`[R2] 前台命令被自动后台化: ${bashTaskId !== null}（task_id=${bashTaskId}, @${taskStartedAt}ms）`);
+    console.error(`[R3] .output 文件存在且实时增长: ${fileGrewOverTime}（maxLines=${maxLines}）`);
+    console.error(`[R3-路径] notif=${notifOutputFile ?? '-'}; 拼接=${candidatePath ?? '-'}`);
+    console.error(`[R3-增长阶梯] ${JSON.stringify(growthSteps.map(s => ({ t: s.t, lines: s.lineCount, last: s.last })))}`);
+    console.error(`\n【结论】TUI Ctrl+O 实时输出的通道推断：${fileGrewOverTime ? '.output 文件（前台命令自动后台化后写入，可实时 tail）' : sawIncrementalStdout ? 'SDK 事件流增量' : '未能确证——需进一步排查路径/时机'}`);
+
+    writeFileSync(`${dir}/fg-output-file.json`, JSON.stringify({
+      sessionId, bashTaskId, taskStartedAt, notifOutputFile, candidatePath,
+      sawIncrementalStdout, fileGrewOverTime, maxLines, duration, fileSnapshots, growthSteps,
+    }, null, 2));
+
+    expect(events.length).toBeGreaterThan(0);
+    // 纯记录，实时性结论靠上面数据（researcher：断结构不断结论）
+  }, 180000);
+});

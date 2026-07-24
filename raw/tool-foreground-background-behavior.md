@@ -689,3 +689,43 @@ t+19213ms  5 行 (tick-5)   ← 每 ~2s 增一行，与命令产出同步
 **这也解释了 SDK 为何自动后台化长前台命令（case-12/13）**：前台阻塞模式下中间输出对用户完全不可见，转后台走 `.output` 文件通道反而获得实时可见性。
 
 **给 CodePilot 的建议**：需要向用户实时展示长命令输出时，应让命令走后台（`run_in_background:true`）并 tail 其 `output_file`；前台命令只能在结束时一次性拿到全部输出。
+
+---
+
+## 前台命令 .output 文件通道（case-19，解释 TUI Ctrl+O）
+
+> 调研人：Claude Code
+> 日期：2026-07-24
+> 环境：同 case-18
+> 目的：解释「case-18a 说前台输出不可实时」与「TUI Ctrl+O 能看到前台命令实时输出」的表面矛盾。Ctrl+O = `app:toggleTranscript`（transcript viewer，`keybindings.md:86` / `interactive-mode.md:32`），显示工具执行详情。假设：TUI 实时可见性来自「长前台命令被自动后台化后写入的 `.output` 文件」，而非 SDK 事件流。命令用 `for i in $(seq 1 10); do echo tick-$i; sleep 2; done`（~20s，10 行）。
+
+### 核心发现
+
+| # | 发现 | 证据 |
+|---|------|------|
+| 48 | **前台命令（run_in_background:false）确实被 SDK 自动后台化** | case-19：`taskStartedAt: 13611ms`，task_id=`benhai9at`（印证 case-12/13） |
+| 49 | **自动后台化后 `.output` 文件实时增长**（用 task_id 拼路径 `{tmp}/claude/{sanitized-cwd}/{session_id}/tasks/{task_id}.output`） | case-19：文件行数 14177ms→2 行、逐级增长到 30353ms→10 行，每 ~2s +1 行；32373ms 后文件被清理 |
+| 50 | **`.output` 路径可由 session_id + task_id 拼出**（无需 notif 给，本例 notifOutputFile=null 但拼接路径可读） | case-19：candidatePath 逐秒读到实时内容 |
+
+### 关于 case-18a 的边界修正
+
+case-18a（`seq 1 8`，16s）测出「前台 SDK 事件流无增量 stdout」，case-19（`seq 1 10`，20s）却测出文件实时增长——两者不矛盾，是**命令长度触发自动后台化的差异**：
+
+- case-18a 命令较短，可能在自动后台化窗口内就接近结束，SDK 事件流视角只看到最终 tool_result 一次性返回。
+- case-19 命令够长，13.6s 时被自动后台化，走上 `.output` 文件通道，可实时 tail。
+
+> ⚠️ **诚实标注局限**：case-19 的 `sawIncrementalStdout: true` 是用 `JSON.stringify(msg)` 全文匹配 `tick-N` 得到的，可能命中 task_progress/task_updated 的 summary 字段，**不足以证明「SDK 事件流能逐字流式 stdout」**。可靠结论仅限 R2（自动后台化，发现 48）和 R3（.output 文件实时增长，发现 49）——这两条是逐秒硬数据。
+
+### 回答「为何 TUI Ctrl+O 能看到前台命令实时输出」
+
+**因为 TUI 里的"前台"长命令实际被 SDK 自动后台化了，输出持续写入 `.output` 文件（case-19 逐秒证明从 2 行涨到 10 行），Ctrl+O 的 transcript viewer 读的就是这个实时文件。** 实时可见性来自**文件通道**，而非 SDK `tool_result` 事件（后者确实一次性）。
+
+> ⚠️ **未完全坐实**：本项目只测 SDK `query()` 层，未直接测 TUI，无法 100% 断言「Ctrl+O 读的就是这个文件」。此结论是「文件实时增长（已证）+ Ctrl+O 是 transcript viewer（文档已证）」的强推断，非直接证据。要钉死需查 TUI 源码或在真实 TUI 中对照文件内容。
+
+### 输出可见性的完整图景（case-18 + case-19）
+
+| 视角 | 短前台命令 | 长前台命令（被自动后台化） | 显式后台命令 |
+|------|-----------|--------------------------|-------------|
+| SDK 事件流（query 调用方） | tool_result 一次性 | tool_result 一次性（事件流不逐字流 stdout） | tool_result 立即返回 backgroundTaskId |
+| `.output` 文件 | 可能不产生 | **实时增长，可 tail**（case-19） | **实时增长，可 tail**（case-18b） |
+| TUI Ctrl+O | 结束后展开看 | **实时可见（读 .output 文件，推断）** | 实时可见 |
