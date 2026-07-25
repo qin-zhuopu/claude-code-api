@@ -20,7 +20,7 @@
  * 来自交接文档：docs/handoffs/foreground-background-tools.md
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { query } from '@anthropic-ai/claude-agent-sdk';
+import { query, getSubagentMessages, listSubagents } from '@anthropic-ai/claude-agent-sdk';
 import { Test, TestingModule } from '@nestjs/testing';
 import { INestApplication, ValidationPipe } from '@nestjs/common';
 import { AppModule } from '../../src/app.module';
@@ -5915,6 +5915,679 @@ describe('subagent 阶段二: 控制方法对 local_agent 是否生效', () => {
       } else {
         console.error(`[否定发现] backgroundTasks 对 local_agent 返回 ${state.controlResult}（非 true）—— 记录实测`);
       }
+    }
+  }, 240000);
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// 阶段三：全生命周期阶段与事件（子问题3）
+// ══════════════════════════════════════════════════════════════════════════
+//
+// case-34 subagent 完整生命周期时间线（对照 Bash 生命周期的核心 case）
+// case-35 SubagentStart/Stop hook（agent_id / agent_transcript_path / background_tasks）
+//
+// 阶段四：实时增量信息（子问题4，重点）
+//
+// case-36 forwardSubagentText true vs false（核心开关）
+// case-37 agentProgressSummaries=true（需 subagent >30s）
+// case-38 getSubagentMessages 主动拉取（1Hz poller）
+// case-39 三通道横向对照 + transcript 文件读
+
+/**
+ * 通用：streaming-input 模式跑一个 subagent，收集所有生命周期事件，
+ * 可注入 extraOptions（forwardSubagentText / agentProgressSummaries / hooks 等），
+ * 可注入 onMessage 回调（用于运行中 poller / hook 时序对齐）。
+ * 用永挂 generator 保持 streaming 模式；靠 query 自然结束或 gate 收尾。
+ */
+async function runSubagentLifecycle(options: {
+  logDir: string;
+  prompt: string;
+  env?: Record<string, string | undefined>;
+  extraOptions?: Record<string, any>;
+  onMessage?: (msg: any, ctx: { relMs: number; queryHandle: any; sessionId: string | null }) => void;
+  onSessionId?: (sessionId: string) => void;
+  maxMs?: number;
+}) {
+  const t0 = Date.now();
+  const events: CapturedSDKEvent[] = [];
+  let sessionId: string | null = null;
+  let index = 0;
+
+  // 生命周期时间线：记录每类 system 消息的到达时刻与关键字段
+  const lifecycle: {
+    kind: string;              // task_started / task_progress / task_notification / task_updated
+    relMs: number;
+    task_id?: string;
+    task_type?: string;
+    tool_use_id?: string;
+    subagent_type?: string;
+    status?: string;
+    hasSummary?: boolean;
+    summarySnippet?: string;
+    last_tool_name?: string;
+    patchKeys?: string[];
+    fields?: string[];
+  }[] = [];
+
+  // forwardSubagentText 统计：带 parent_tool_use_id 的 text/thinking delta
+  const deltaStats = {
+    textDeltaWithParent: 0,     // parent_tool_use_id != null 的 text_delta 数（近似：属于 subagent 块）
+    thinkingDeltaTotal: 0,
+    textDeltaTotal: 0,
+    subagentAssistantMsgs: 0,   // 带 subagent_type/task_description 的 assistant 消息
+    subagentAssistantSnaps: [] as { relMs: number; subagent_type: string | null; task_description: string | null; parentId: string | null; hasText: boolean; hasThinking: boolean }[],
+  };
+
+  // 跟踪当前 content_block 是否属于 subagent（parent_tool_use_id 由 message 层给出，delta 无 parent 信息，
+  // 故用「最近一条 assistant 是否带 parent_tool_use_id」近似标注 delta 归属）
+  let currentMsgHasParent = false;
+
+  const gen = (async function* () {
+    const msg1: any = {
+      type: 'user',
+      message: { role: 'user', content: options.prompt },
+      parent_tool_use_id: null,
+    };
+    yield msg1;
+    // 永挂：靠 query 自然结束（result）跳出 for-await
+    await new Promise<void>(() => {});
+  })();
+
+  const env = { ...(options.env || BIGMODEL_ENV), OTEL_LOG_RAW_API_BODIES: `file:${options.logDir}` };
+  const sdkQuery = query({
+    prompt: gen,
+    options: {
+      env,
+      includePartialMessages: true,
+      persistSession: false,
+      settingSources: [],
+      effort: 'low',
+      permissionMode: 'bypassPermissions',
+      ...(options.extraOptions || {}),
+    } as any,
+  });
+  const queryHandle: any = sdkQuery;
+
+  const observer = setInterval(() => {
+    const t = Date.now() - t0;
+    console.error(`[obs t=${t}ms] lifecycle=${lifecycle.length} fwdText(parent)=${deltaStats.textDeltaWithParent} subAsstMsgs=${deltaStats.subagentAssistantMsgs} sid=${sessionId ?? '-'}`);
+  }, 2000);
+
+  const maxMs = options.maxMs ?? 175000;
+  const hardStop = setTimeout(() => {
+    console.error(`[hardStop] ${maxMs}ms 到，close query`);
+    try { queryHandle.close?.(); } catch {}
+  }, maxMs);
+
+  try {
+    for await (const message of sdkQuery) {
+      const msg = message as any;
+      const type = msg.type || 'unknown';
+      const rel = Date.now() - t0;
+      const captured: CapturedSDKEvent = { index: index++, type, timestamp: Date.now() };
+
+      // sessionId 捕获（system init 或任意带 session_id 的消息）
+      if (!sessionId && msg.session_id) {
+        sessionId = msg.session_id;
+        options.onSessionId?.(sessionId);
+        console.error(`\n[${rel}ms] sessionId=${sessionId}`);
+      }
+
+      if (type === 'stream_event' && msg.event) {
+        const evt = msg.event;
+        captured.eventType = evt.type;
+        if (evt.type === 'content_block_delta' && evt.delta) {
+          captured.deltaType = evt.delta.type;
+          if (evt.delta.type === 'text_delta') {
+            deltaStats.textDeltaTotal++;
+            if (currentMsgHasParent) deltaStats.textDeltaWithParent++;
+            process.stderr.write(evt.delta.text);
+          }
+          if (evt.delta.type === 'thinking_delta') {
+            deltaStats.thinkingDeltaTotal++;
+          }
+        }
+      }
+
+      if (type === 'system') {
+        captured.subtype = msg.subtype;
+        if (msg.subtype === 'task_started') {
+          captured.taskId = msg.task_id;
+          captured.taskType = msg.task_type;
+          captured.raw = { ...msg };
+          lifecycle.push({
+            kind: 'task_started', relMs: rel, task_id: msg.task_id, task_type: msg.task_type,
+            tool_use_id: msg.tool_use_id, subagent_type: msg.subagent_type,
+            fields: Object.keys(msg),
+          });
+          console.error(`\n[${rel}ms] task_started task_id=${msg.task_id} type=${msg.task_type} subagent_type=${msg.subagent_type ?? '-'}`);
+        }
+        if (msg.subtype === 'task_progress') {
+          captured.taskId = msg.task_id;
+          captured.taskType = msg.task_type;
+          const hasSummary = msg.summary != null && String(msg.summary).length > 0;
+          captured.raw = { subagent_type: msg.subagent_type, last_tool_name: msg.last_tool_name, hasSummary };
+          lifecycle.push({
+            kind: 'task_progress', relMs: rel, task_id: msg.task_id, task_type: msg.task_type,
+            subagent_type: msg.subagent_type, last_tool_name: msg.last_tool_name,
+            hasSummary, summarySnippet: hasSummary ? String(msg.summary).substring(0, 200) : undefined,
+            fields: Object.keys(msg),
+          });
+        }
+        if (msg.subtype === 'task_updated') {
+          const p = msg.patch || {};
+          captured.taskId = msg.task_id;
+          captured.raw = { patch: p };
+          lifecycle.push({ kind: 'task_updated', relMs: rel, task_id: msg.task_id, status: p.status, patchKeys: Object.keys(p) });
+        }
+        if (msg.subtype === 'task_notification') {
+          captured.taskId = msg.task_id;
+          captured.taskStatus = msg.status;
+          captured.taskType = msg.task_type;
+          captured.raw = { status: msg.status, task_type: msg.task_type, output_file: msg.output_file };
+          lifecycle.push({
+            kind: 'task_notification', relMs: rel, task_id: msg.task_id, task_type: msg.task_type,
+            status: msg.status, fields: Object.keys(msg),
+          });
+          console.error(`\n[${rel}ms] task_notification task_id=${msg.task_id} status=${msg.status}`);
+        }
+      }
+
+      if (type === 'assistant' && msg.message?.content) {
+        currentMsgHasParent = msg.parent_tool_use_id != null;
+        const hasSub = msg.subagent_type != null || msg.task_description != null || msg.parent_tool_use_id != null;
+        let hasText = false, hasThinking = false;
+        for (const block of msg.message.content) {
+          if (block.type === 'tool_use') { captured.toolName = block.name; captured.toolUseId = block.id; if (!captured.raw) captured.raw = {}; captured.raw.toolInput = block.input; }
+          if (block.type === 'text') hasText = true;
+          if (block.type === 'thinking') hasThinking = true;
+        }
+        if (hasSub) {
+          deltaStats.subagentAssistantMsgs++;
+          deltaStats.subagentAssistantSnaps.push({
+            relMs: rel, subagent_type: msg.subagent_type ?? null, task_description: msg.task_description ?? null,
+            parentId: msg.parent_tool_use_id ?? null, hasText, hasThinking,
+          });
+        }
+      } else if (type !== 'stream_event') {
+        currentMsgHasParent = false;
+      }
+
+      if (type === 'result') {
+        captured.raw = { subtype: msg.subtype, num_turns: msg.num_turns };
+        console.error(`\n[${rel}ms] result subtype=${msg.subtype}`);
+      }
+
+      events.push(captured);
+      options.onMessage?.(msg, { relMs: rel, queryHandle, sessionId });
+
+      if (type === 'result') break;
+    }
+  } finally {
+    clearInterval(observer);
+    clearTimeout(hardStop);
+    try { queryHandle.close?.(); } catch {}
+  }
+
+  return { events, lifecycle, deltaStats, sessionId, duration: Date.now() - t0 };
+}
+
+// ====== case-34 subagent 完整生命周期时间线 ======
+//
+// 让 subagent 跑一个多步骤任务，重建完整事件序列：
+//   task_started(local_agent) → task_progress(多条) → task_notification/task_updated
+// 记录每个阶段的字段、相对时刻、内外层 task（local_agent + local_bash）的嵌套关系。
+// 这是对照 Bash 生命周期的核心 case——画出 subagent 版的完整生命周期图。
+
+describe('subagent 阶段三: 完整生命周期时间线', () => {
+  // 多步骤任务：让 subagent 连续跑几个 Bash 步骤，产生多条 task_progress
+  const MULTISTEP_PROMPT = 'Use the Agent tool to launch a subagent in the FOREGROUND (set run_in_background to false, do NOT background it, wait for it to fully finish before you respond). Instruct the subagent to do these steps in order using Bash: (1) run "echo step1 && sleep 3", (2) run "echo step2 && sleep 3", (3) run "echo step3 && sleep 3", then report all three outputs. Let the subagent do the full multi-step work.';
+
+  it('case-34 重建 subagent 生命周期序列（task_started→progress→notification）', async () => {
+    const dir = createTimestampDir('tool-foreground-background/case-34-lifecycle-timeline');
+    const { events, lifecycle, sessionId, duration } = await runSubagentLifecycle({
+      logDir: dir, prompt: MULTISTEP_PROMPT, env: BIGMODEL_ENV, maxMs: 175000,
+    });
+
+    printTimeline('Case 34: subagent 完整生命周期', events, duration);
+
+    // 拆分内外层 task
+    const byType = new Map<string, string[]>(); // task_id -> task_type
+    for (const l of lifecycle) if (l.task_id && l.task_type) byType.set(l.task_id, [l.task_type]);
+    const agentTasks = [...byType.entries()].filter(([, v]) => v[0] === 'local_agent').map(([k]) => k);
+    const bashTasks = [...byType.entries()].filter(([, v]) => v[0] === 'local_bash').map(([k]) => k);
+
+    const started = lifecycle.filter(l => l.kind === 'task_started');
+    const progress = lifecycle.filter(l => l.kind === 'task_progress');
+    const notif = lifecycle.filter(l => l.kind === 'task_notification');
+    const updated = lifecycle.filter(l => l.kind === 'task_updated');
+
+    console.error('\n══════ case-34 实测值（生命周期时间线）══════');
+    console.error(`[C1] sessionId=${sessionId}`);
+    console.error(`[C2] task_started 数=${started.length}（local_agent=${agentTasks.length} local_bash=${bashTasks.length}）`);
+    console.error(`[C3] task_progress 数=${progress.length}；带 summary 的=${progress.filter(p => p.hasSummary).length}`);
+    console.error(`[C4] task_notification 数=${notif.length}（statuses=${notif.map(n => n.status).join(',')}）`);
+    console.error(`[C5] task_updated 数=${updated.length}`);
+    console.error(`[C6] task_started 字段: ${JSON.stringify(started[0]?.fields ?? [])}`);
+    console.error(`[C7] task_progress 字段: ${JSON.stringify(progress[0]?.fields ?? [])}`);
+    console.error(`[C8] task_notification 字段: ${JSON.stringify(notif[0]?.fields ?? [])}`);
+    console.error('[C9] 生命周期序列（相对时刻）:');
+    for (const l of lifecycle) {
+      console.error(`   [${String(l.relMs).padStart(6)}ms] ${l.kind.padEnd(18)} type=${l.task_type ?? '-'} status=${l.status ?? '-'} task_id=${(l.task_id ?? '-').substring(0, 12)} ${l.last_tool_name ? 'lastTool=' + l.last_tool_name : ''}`);
+    }
+
+    writeFileSync(`${dir}/lifecycle.json`, JSON.stringify({
+      sessionId, duration,
+      counts: { started: started.length, progress: progress.length, notif: notif.length, updated: updated.length, agentTasks: agentTasks.length, bashTasks: bashTasks.length },
+      lifecycle,
+    }, null, 2));
+    writeFileSync(`${dir}/sdk-events.json`, JSON.stringify(events, null, 2));
+
+    // ── 断言 ──
+    expect(events.length).toBeGreaterThan(0);
+    if (started.filter(s => s.task_type === 'local_agent').length === 0) {
+      console.error('[否定发现] 未观测到 task_started(local_agent) —— GLM 本轮未触发真实 subagent');
+    } else {
+      // 至少有一条 local_agent 的 task_started
+      expect(started.some(s => s.task_type === 'local_agent')).toBe(true);
+      // 完整生命周期：有 started 就应有 notification 收尾
+      if (notif.length > 0) {
+        console.error('[发现] ✅ subagent 走完整生命周期：task_started → ... → task_notification');
+      } else {
+        console.error('[否定发现] 有 task_started 但无 task_notification（可能被 hardStop 截断）');
+      }
+    }
+  }, 240000);
+});
+
+// ====== case-35 SubagentStart/Stop hook ======
+//
+// 通过 Options.hooks 注册 SubagentStart 和 SubagentStop hook，
+// 捕获 agent_id、agent_type、agent_transcript_path、background_tasks 字段。
+// 断言：Start 时机 vs task_started、Stop 时机 vs task_notification 的对齐关系；
+//       agent_id 与 task_id/tool_use_id 的映射。
+// 本地网关不支持 hook 或触发不到，如实记否定发现。
+
+describe('subagent 阶段三: SubagentStart/Stop hook', () => {
+  const HOOK_PROMPT = 'Use the Agent tool to launch a subagent in the FOREGROUND (set run_in_background to false, do NOT background it, wait for it to fully finish before you respond). Instruct the subagent to run the Bash command "echo hook-probe && sleep 5" and report the output.';
+
+  it('case-35 SubagentStart/Stop hook 捕获 agent_id/transcript_path', async () => {
+    const dir = createTimestampDir('tool-foreground-background/case-35-subagent-hooks');
+
+    const hookHits: {
+      event: string; relMs: number; agent_id?: string; agent_type?: string;
+      agent_transcript_path?: string; background_tasks?: any; last_assistant_message?: string;
+      fields: string[];
+    }[] = [];
+    const t0 = Date.now();
+
+    const makeHook = (eventName: string) => async (input: any) => {
+      const rel = Date.now() - t0;
+      hookHits.push({
+        event: eventName, relMs: rel,
+        agent_id: input?.agent_id, agent_type: input?.agent_type,
+        agent_transcript_path: input?.agent_transcript_path,
+        background_tasks: input?.background_tasks,
+        last_assistant_message: input?.last_assistant_message ? String(input.last_assistant_message).substring(0, 120) : undefined,
+        fields: input ? Object.keys(input) : [],
+      });
+      console.error(`\n[hook ${eventName} @${rel}ms] agent_id=${input?.agent_id ?? '-'} agent_type=${input?.agent_type ?? '-'} transcript=${input?.agent_transcript_path ?? '-'}`);
+      return { continue: true };
+    };
+
+    const { events, lifecycle, sessionId, duration } = await runSubagentLifecycle({
+      logDir: dir, prompt: HOOK_PROMPT, env: BIGMODEL_ENV, maxMs: 120000,
+      extraOptions: {
+        hooks: {
+          SubagentStart: [{ hooks: [makeHook('SubagentStart')] }],
+          SubagentStop: [{ hooks: [makeHook('SubagentStop')] }],
+        },
+      },
+    });
+
+    printTimeline('Case 35: SubagentStart/Stop hook', events, duration);
+
+    const startHits = hookHits.filter(h => h.event === 'SubagentStart');
+    const stopHits = hookHits.filter(h => h.event === 'SubagentStop');
+    const agentStarted = lifecycle.find(l => l.kind === 'task_started' && l.task_type === 'local_agent');
+    const agentNotif = lifecycle.find(l => l.kind === 'task_notification');
+
+    console.error('\n══════ case-35 实测值（SubagentStart/Stop hook）══════');
+    console.error(`[D1] SubagentStart hook 命中数=${startHits.length}；SubagentStop 命中数=${stopHits.length}`);
+    console.error(`[D2] SubagentStart 字段: ${JSON.stringify(startHits[0]?.fields ?? [])}`);
+    console.error(`[D3] SubagentStop 字段: ${JSON.stringify(stopHits[0]?.fields ?? [])}`);
+    console.error(`[D4] agent_id(start)=${startHits[0]?.agent_id ?? '-'} agent_type=${startHits[0]?.agent_type ?? '-'}`);
+    console.error(`[D5] agent_transcript_path(stop)=${stopHits[0]?.agent_transcript_path ?? '-'}`);
+    console.error(`[D6] SubagentStart@${startHits[0]?.relMs ?? '-'}ms vs task_started(local_agent)@${agentStarted?.relMs ?? '-'}ms`);
+    console.error(`[D7] SubagentStop@${stopHits[0]?.relMs ?? '-'}ms vs task_notification@${agentNotif?.relMs ?? '-'}ms`);
+    console.error(`[D8] agent_id vs task_started.task_id=${agentStarted?.task_id ?? '-'} / tool_use_id=${agentStarted?.tool_use_id ?? '-'}（映射?）`);
+    console.error(`[D9] background_tasks(start)=${JSON.stringify(startHits[0]?.background_tasks ?? null)}`);
+    console.error(`[D10] last_assistant_message(stop)=${stopHits[0]?.last_assistant_message ?? '-'}`);
+
+    writeFileSync(`${dir}/hook-hits.json`, JSON.stringify({ sessionId, duration, hookHits, agentStarted, agentNotif }, null, 2));
+    writeFileSync(`${dir}/sdk-events.json`, JSON.stringify(events, null, 2));
+
+    // ── 断言 ──
+    expect(events.length).toBeGreaterThan(0);
+    if (hookHits.length === 0) {
+      console.error('[否定发现] SubagentStart/Stop hook 一次都未命中 —— 本地网关/SDK 可能不经该路径触发 subagent hook，或未触发真实 subagent');
+    } else {
+      console.error('[发现] ✅ SubagentStart/Stop hook 被触发，捕获到 agent_id 等字段');
+      if (startHits.length > 0) expect(startHits[0].agent_id).toBeDefined();
+    }
+  }, 240000);
+});
+
+// ====== case-36 forwardSubagentText true vs false ======
+//
+// 核心开关（sdk.d.ts:1594）。同一 prompt 两跑（forwardSubagentText 分别 true/false），
+// 统计带 parent_tool_use_id 的 text/thinking delta 和带 subagent_type/task_description 的 assistant 消息数。
+// 断言：false 只见 subagent 的 tool_use/tool_result；true 额外转发完整子会话 text/thinking。
+// 这是"实时看 subagent 在说什么/想什么"的主通道。
+
+describe('subagent 阶段四: forwardSubagentText 核心开关', () => {
+  // 纯文本子任务：让 subagent 不用任何工具，只输出一大段解释文本。
+  // 这样 false 时应只见 tool_use/tool_result（无子会话 text），true 时额外转发子会话 text/thinking。
+  const FWD_PROMPT = 'Use the Agent tool to launch a subagent in the FOREGROUND (run_in_background false, wait for it to finish). Instruct the subagent to NOT use any tools at all, and to write a detailed 5-sentence explanation of what a REST API is, purely from its own knowledge. The subagent should only produce explanatory text, no tool calls.';
+
+  it('case-36 forwardSubagentText true vs false 对照', async () => {
+    const dirFalse = createTimestampDir('tool-foreground-background/case-36-fwd-false');
+    const dirTrue = createTimestampDir('tool-foreground-background/case-36-fwd-true');
+
+    const runFalse = await runSubagentLifecycle({
+      logDir: dirFalse, prompt: FWD_PROMPT, env: BIGMODEL_ENV, maxMs: 150000,
+      extraOptions: { forwardSubagentText: false },
+    });
+    const runTrue = await runSubagentLifecycle({
+      logDir: dirTrue, prompt: FWD_PROMPT, env: BIGMODEL_ENV, maxMs: 150000,
+      extraOptions: { forwardSubagentText: true },
+    });
+
+    console.error('\n══════ case-36 实测值（forwardSubagentText 对照）══════');
+    console.error('               false      true');
+    console.error(`subAsstMsgs    ${String(runFalse.deltaStats.subagentAssistantMsgs).padEnd(10)} ${runTrue.deltaStats.subagentAssistantMsgs}`);
+    console.error(`textDelta(parent) ${String(runFalse.deltaStats.textDeltaWithParent).padEnd(7)} ${runTrue.deltaStats.textDeltaWithParent}`);
+    console.error(`thinkingDelta  ${String(runFalse.deltaStats.thinkingDeltaTotal).padEnd(10)} ${runTrue.deltaStats.thinkingDeltaTotal}`);
+    console.error(`textDeltaTotal ${String(runFalse.deltaStats.textDeltaTotal).padEnd(10)} ${runTrue.deltaStats.textDeltaTotal}`);
+    console.error('[E1] false 的 subagent assistant 快照:', JSON.stringify(runFalse.deltaStats.subagentAssistantSnaps.slice(0, 3)));
+    console.error('[E2] true 的 subagent assistant 快照:', JSON.stringify(runTrue.deltaStats.subagentAssistantSnaps.slice(0, 3)));
+
+    writeFileSync(`${dirFalse}/fwd-false.json`, JSON.stringify({ deltaStats: runFalse.deltaStats, duration: runFalse.duration }, null, 2));
+    writeFileSync(`${dirTrue}/fwd-true.json`, JSON.stringify({ deltaStats: runTrue.deltaStats, duration: runTrue.duration }, null, 2));
+
+    // ── 断言 ──
+    expect(runFalse.events.length).toBeGreaterThan(0);
+    expect(runTrue.events.length).toBeGreaterThan(0);
+    const bothTriggered = runFalse.lifecycle.some(l => l.task_type === 'local_agent') && runTrue.lifecycle.some(l => l.task_type === 'local_agent');
+    if (!bothTriggered) {
+      console.error('[否定发现] 至少一跑未触发真实 subagent（无 local_agent task_started），无法做净对照');
+    } else if (runTrue.deltaStats.subagentAssistantMsgs > runFalse.deltaStats.subagentAssistantMsgs) {
+      console.error('[发现] ✅ forwardSubagentText=true 转发了更多子会话 assistant 消息（带 subagent_type/parent_tool_use_id）');
+    } else {
+      console.error(`[否定发现] true(${runTrue.deltaStats.subagentAssistantMsgs}) 未多于 false(${runFalse.deltaStats.subagentAssistantMsgs}) —— 记录实测，可能 GLM 子会话无独立 text 或转发路径不同`);
+    }
+  }, 360000);
+});
+
+// ====== case-37 agentProgressSummaries=true ======
+//
+// sdk.d.ts:1755。需 subagent 运行 >30s（构造够久子任务）。
+// 捕获 task_progress.summary 的 fork 摘要推送，记录首个 summary 到达时刻（验证 ~30s）、间隔、字段结构；
+// 对照关闭时应无 summary。触发不到（任务不够久 / 本地网关不支持）如实记录。
+
+describe('subagent 阶段四: agentProgressSummaries 进度摘要', () => {
+  // 够久：让 subagent 跑多个 sleep，累计 >55s，逼出 ~30s 的 summary fork。
+  // 必须 FOREGROUND，否则主 turn 不阻塞、query 提前结束、subagent 跑不满 30s。
+  const LONG_PROMPT = 'Use the Agent tool to launch a subagent in the FOREGROUND (set run_in_background to false, do NOT background it, wait for it to fully finish before you respond). Instruct the subagent to run these Bash commands one by one, reporting after each: (1) "echo phase1 && sleep 15", (2) "echo phase2 && sleep 15", (3) "echo phase3 && sleep 15", (4) "echo done && sleep 15". Do all four in order, then summarize.';
+
+  it('case-37 agentProgressSummaries=true 捕获 summary fork（对照 off）', async () => {
+    const dirOn = createTimestampDir('tool-foreground-background/case-37-summaries-on');
+    const dirOff = createTimestampDir('tool-foreground-background/case-37-summaries-off');
+
+    const runOn = await runSubagentLifecycle({
+      logDir: dirOn, prompt: LONG_PROMPT, env: BIGMODEL_ENV, maxMs: 175000,
+      extraOptions: { agentProgressSummaries: true },
+    });
+    const runOff = await runSubagentLifecycle({
+      logDir: dirOff, prompt: LONG_PROMPT, env: BIGMODEL_ENV, maxMs: 175000,
+      extraOptions: { agentProgressSummaries: false },
+    });
+
+    const onSummaries = runOn.lifecycle.filter(l => l.kind === 'task_progress' && l.hasSummary);
+    const offSummaries = runOff.lifecycle.filter(l => l.kind === 'task_progress' && l.hasSummary);
+    const onProgress = runOn.lifecycle.filter(l => l.kind === 'task_progress');
+
+    console.error('\n══════ case-37 实测值（agentProgressSummaries）══════');
+    console.error(`[F1] ON: task_progress 数=${onProgress.length}，带 summary 数=${onSummaries.length}`);
+    console.error(`[F2] OFF: 带 summary 数=${offSummaries.length}（期望 0）`);
+    console.error(`[F3] ON 首个 summary 到达时刻=${onSummaries[0]?.relMs ?? '-'}ms（期望 ~30s）`);
+    console.error(`[F4] ON summary 到达时刻序列=${JSON.stringify(onSummaries.map(s => s.relMs))}`);
+    console.error(`[F5] ON 首个 summary 内容片段=${onSummaries[0]?.summarySnippet ?? '-'}`);
+    console.error(`[F6] ON 运行时长=${runOn.duration}ms；OFF 运行时长=${runOff.duration}ms`);
+
+    writeFileSync(`${dirOn}/summaries-on.json`, JSON.stringify({ onProgress: onProgress.length, onSummaries, duration: runOn.duration }, null, 2));
+    writeFileSync(`${dirOff}/summaries-off.json`, JSON.stringify({ offSummaries, duration: runOff.duration }, null, 2));
+
+    // ── 断言 ──
+    expect(runOn.events.length).toBeGreaterThan(0);
+    if (!runOn.lifecycle.some(l => l.task_type === 'local_agent')) {
+      console.error('[否定发现] ON 跑未触发真实 subagent，无法评估 summary');
+    } else if (onSummaries.length > 0) {
+      console.error('[发现] ✅ agentProgressSummaries=true 推送了 task_progress.summary');
+      expect(offSummaries.length).toBeLessThanOrEqual(onSummaries.length);
+    } else {
+      console.error('[否定发现] ON 跑无 summary —— 可能子任务未跑够 30s / 本地网关不支持 fork summary / GLM 未走该路径');
+    }
+  }, 420000);
+});
+
+// ====== case-38 getSubagentMessages 主动拉取 ======
+//
+// sdk.d.ts:760。运行中用 1Hz poller 调 getSubagentMessages(sessionId, agentId)，
+// 观察返回条数是否随 subagent 进展单调增长。
+// agentId 来自 listSubagents()（sdk.d.ts:973）或 case-35 的 SubagentStart hook。
+// 断言拉取增量与流式 delta 的时序对齐。方法在本地网关不可用如实记否定发现。
+
+describe('subagent 阶段四: getSubagentMessages 主动拉取', () => {
+  // FOREGROUND + persistSession:true —— 让 subagent transcript 真正落盘，
+  // getSubagentMessages/listSubagents 才有 JSONL 可读（case-38 首跑 persistSession:false 全程返回空，
+  // 推断正是因为无落盘 transcript）。
+  const PULL_PROMPT = 'Use the Agent tool to launch a subagent in the FOREGROUND (set run_in_background to false, do NOT background it, wait for it to fully finish before you respond). Instruct the subagent to run these Bash commands in order: (1) "echo pull1 && sleep 6", (2) "echo pull2 && sleep 6", (3) "echo pull3 && sleep 6", then report. Do all steps.';
+
+  it('case-38 getSubagentMessages/listSubagents 运行中拉取增量', async () => {
+    const dir = createTimestampDir('tool-foreground-background/case-38-getsubagentmessages');
+
+    let capturedSessionId: string | null = null;
+    let capturedAgentId: string | null = null;
+    const pollSamples: { relMs: number; source: string; agentId: string | null; msgCount: number | string; listCount: number | string }[] = [];
+
+    // SubagentStart hook 抓 agent_id（作为 listSubagents 的备用来源）
+    const t0 = Date.now();
+    const startHook = async (input: any) => {
+      if (!capturedAgentId && input?.agent_id) {
+        capturedAgentId = input.agent_id;
+        console.error(`\n[hook SubagentStart @${Date.now() - t0}ms] agent_id=${capturedAgentId}`);
+      }
+      return { continue: true };
+    };
+
+    // 1Hz poller
+    let pollerActive = false;
+    const poller = setInterval(async () => {
+      if (!pollerActive || !capturedSessionId) return;
+      const rel = Date.now() - t0;
+      // 先试 listSubagents
+      let listCount: number | string = '-';
+      let agentIds: string[] = [];
+      try {
+        if (typeof listSubagents === 'function') {
+          agentIds = await listSubagents(capturedSessionId);
+          listCount = agentIds.length;
+          if (!capturedAgentId && agentIds.length > 0) capturedAgentId = agentIds[0];
+        } else listCount = 'NO_FN';
+      } catch (e: any) { listCount = `ERR:${e?.message?.substring(0, 40)}`; }
+
+      const aid = capturedAgentId || agentIds[0] || null;
+      let msgCount: number | string = '-';
+      if (aid) {
+        try {
+          if (typeof getSubagentMessages === 'function') {
+            const msgs = await getSubagentMessages(capturedSessionId, aid);
+            msgCount = Array.isArray(msgs) ? msgs.length : 'NON_ARRAY';
+          } else msgCount = 'NO_FN';
+        } catch (e: any) { msgCount = `ERR:${e?.message?.substring(0, 40)}`; }
+      }
+      pollSamples.push({ relMs: rel, source: 'poll', agentId: aid, msgCount, listCount });
+      console.error(`[poll @${rel}ms] listSubagents=${listCount} agentId=${aid ?? '-'} getSubagentMessages.len=${msgCount}`);
+    }, 1000);
+
+    let res: any;
+    try {
+      pollerActive = true;
+      res = await runSubagentLifecycle({
+        logDir: dir, prompt: PULL_PROMPT, env: BIGMODEL_ENV, maxMs: 150000,
+        extraOptions: { persistSession: true, hooks: { SubagentStart: [{ hooks: [startHook] }] } },
+        onSessionId: (sid) => { capturedSessionId = sid; },
+      });
+    } finally {
+      pollerActive = false;
+      clearInterval(poller);
+    }
+
+    const msgCounts = pollSamples.map(s => typeof s.msgCount === 'number' ? s.msgCount : -1).filter(n => n >= 0);
+    const monotonic = msgCounts.every((v, i) => i === 0 || v >= msgCounts[i - 1]);
+    const grew = msgCounts.length > 1 && msgCounts[msgCounts.length - 1] > msgCounts[0];
+
+    console.error('\n══════ case-38 实测值（getSubagentMessages 拉取）══════');
+    console.error(`[G1] sessionId=${capturedSessionId} agentId=${capturedAgentId}`);
+    console.error(`[G2] poll 样本数=${pollSamples.length}`);
+    console.error(`[G3] listSubagents 返回值序列=${JSON.stringify(pollSamples.map(s => s.listCount))}`);
+    console.error(`[G4] getSubagentMessages.len 序列=${JSON.stringify(pollSamples.map(s => s.msgCount))}`);
+    console.error(`[G5] 有效 msgCount 序列=${JSON.stringify(msgCounts)}；单调不减=${monotonic}；增长=${grew}`);
+
+    writeFileSync(`${dir}/poll-samples.json`, JSON.stringify({ sessionId: capturedSessionId, agentId: capturedAgentId, pollSamples, monotonic, grew }, null, 2));
+
+    // ── 断言 ──
+    expect(res.events.length).toBeGreaterThan(0);
+    const anyValidMsgCount = pollSamples.some(s => typeof s.msgCount === 'number');
+    const anyValidList = pollSamples.some(s => typeof s.listCount === 'number');
+    if (!anyValidList && !anyValidMsgCount) {
+      console.error('[否定发现] listSubagents / getSubagentMessages 全程未返回有效值（可能本地文件系统无 transcript / 方法在本网关不可用 / agentId 拿不到）');
+    } else {
+      console.error(`[发现] getSubagentMessages 可用；单调不减=${monotonic} 增长=${grew}`);
+    }
+  }, 240000);
+});
+
+// ====== case-39 三通道横向对照 + transcript 文件读 ======
+//
+// 若 case-35 拿到 agent_transcript_path，用 poller 读该 transcript 文件观察落盘增量。
+// 最后横向对照三条实时增量通道：
+//   (1) forwardSubagentText 流式  (2) getSubagentMessages 拉取  (3) transcript 文件读
+// 比较时延、完整度、可用性，给出 CodePilot 选型结论。
+
+describe('subagent 阶段四: 三通道横向对照', () => {
+  const TRI_PROMPT = 'Use the Agent tool to launch a subagent in the FOREGROUND (set run_in_background to false, do NOT background it, wait for it to fully finish before you respond). Instruct the subagent to run these Bash commands in order, reporting after each: (1) "echo tri1 && sleep 6", (2) "echo tri2 && sleep 6", (3) "echo tri3 && sleep 6", then give a short summary. Do all steps.';
+
+  it('case-39 forwardSubagentText / getSubagentMessages / transcript 文件 三通道对照', async () => {
+    const dir = createTimestampDir('tool-foreground-background/case-39-three-channels');
+
+    const t0 = Date.now();
+    let capturedSessionId: string | null = null;
+    let capturedAgentId: string | null = null;
+    let transcriptPath: string | null = null;
+
+    // 通道A：forwardSubagentText 流式 —— 记录首个 subagent text delta 时刻
+    let firstFwdTextAt: number | null = null;
+    // 通道B：getSubagentMessages 拉取 —— poller 采样
+    // 通道C：transcript 文件读 —— poller 读文件行数
+    const channelSamples: { relMs: number; pullLen: number | string; transcriptLines: number | string }[] = [];
+
+    const startHook = async (input: any) => {
+      if (input?.agent_id && !capturedAgentId) capturedAgentId = input.agent_id;
+      return { continue: true };
+    };
+    const stopHook = async (input: any) => {
+      if (input?.agent_transcript_path && !transcriptPath) {
+        transcriptPath = input.agent_transcript_path;
+        console.error(`\n[hook SubagentStop @${Date.now() - t0}ms] transcript_path=${transcriptPath}`);
+      }
+      if (input?.agent_id && !capturedAgentId) capturedAgentId = input.agent_id;
+      return { continue: true };
+    };
+
+    let pollerActive = false;
+    const poller = setInterval(async () => {
+      if (!pollerActive) return;
+      const rel = Date.now() - t0;
+      let pullLen: number | string = '-';
+      if (capturedSessionId && capturedAgentId && typeof getSubagentMessages === 'function') {
+        try { const m = await getSubagentMessages(capturedSessionId, capturedAgentId); pullLen = Array.isArray(m) ? m.length : 'NON_ARRAY'; }
+        catch (e: any) { pullLen = `ERR:${e?.message?.substring(0, 30)}`; }
+      }
+      let transcriptLines: number | string = '-';
+      if (transcriptPath && existsSync(transcriptPath)) {
+        try { transcriptLines = readFileSync(transcriptPath, 'utf-8').split('\n').filter(l => l.trim()).length; }
+        catch (e: any) { transcriptLines = `ERR:${e?.message?.substring(0, 30)}`; }
+      }
+      channelSamples.push({ relMs: rel, pullLen, transcriptLines });
+    }, 1000);
+
+    // 复用 runSubagentLifecycle，但需在 onMessage 里抓「首个 subagent text delta」
+    // runSubagentLifecycle 已统计 textDeltaWithParent；此处额外记录首次时刻
+    const res = await (async () => {
+      pollerActive = true;
+      try {
+        return await runSubagentLifecycle({
+          logDir: dir, prompt: TRI_PROMPT, env: BIGMODEL_ENV, maxMs: 150000,
+          extraOptions: { forwardSubagentText: true, persistSession: true, hooks: { SubagentStart: [{ hooks: [startHook] }], SubagentStop: [{ hooks: [stopHook] }] } },
+          onSessionId: (sid) => { capturedSessionId = sid; },
+          onMessage: (msg, ctx) => {
+            if (firstFwdTextAt == null && msg.type === 'stream_event' && msg.event?.type === 'content_block_delta'
+              && msg.event.delta?.type === 'text_delta') {
+              // 近似：subagent 阶段的 text delta（无法从 delta 直接读 parent，用 deltaStats 侧的 parent 计数辅助）
+            }
+          },
+        });
+      } finally { pollerActive = false; clearInterval(poller); }
+    })();
+
+    // 从 deltaStats 的 subagent assistant 快照取首个带 text 的 subagent 消息时刻（通道A代理指标）
+    const firstSubText = res.deltaStats.subagentAssistantSnaps.find(s => s.hasText);
+    firstFwdTextAt = firstSubText?.relMs ?? null;
+
+    const pullValid = channelSamples.filter(s => typeof s.pullLen === 'number');
+    const transcriptValid = channelSamples.filter(s => typeof s.transcriptLines === 'number');
+
+    console.error('\n══════ case-39 实测值（三通道横向对照）══════');
+    console.error(`[H1] sessionId=${capturedSessionId} agentId=${capturedAgentId} transcriptPath=${transcriptPath}`);
+    console.error(`[H2] 通道A forwardSubagentText: subagent assistant 消息数=${res.deltaStats.subagentAssistantMsgs}，首个带 text 的 subagent 消息@${firstFwdTextAt ?? '-'}ms`);
+    console.error(`[H3] 通道B getSubagentMessages: 有效样本=${pullValid.length}，len 序列=${JSON.stringify(channelSamples.map(s => s.pullLen))}`);
+    console.error(`[H4] 通道C transcript 文件: 拿到路径=${transcriptPath != null}，有效样本=${transcriptValid.length}，行数序列=${JSON.stringify(channelSamples.map(s => s.transcriptLines))}`);
+    console.error('[H5] 三通道可用性小结:');
+    console.error(`   A forwardSubagentText: ${res.deltaStats.subagentAssistantMsgs > 0 ? '可用（流式实时）' : '未见子会话消息'}`);
+    console.error(`   B getSubagentMessages: ${pullValid.length > 0 ? '可用（主动拉取）' : '不可用/未返回'}`);
+    console.error(`   C transcript 文件:     ${transcriptValid.length > 0 ? '可用（落盘增量）' : transcriptPath ? '路径存在但读不到' : '未拿到路径'}`);
+
+    writeFileSync(`${dir}/three-channels.json`, JSON.stringify({
+      sessionId: capturedSessionId, agentId: capturedAgentId, transcriptPath,
+      channelA: { subagentAssistantMsgs: res.deltaStats.subagentAssistantMsgs, firstFwdTextAt, snaps: res.deltaStats.subagentAssistantSnaps },
+      channelB_samples: channelSamples.map(s => ({ relMs: s.relMs, pullLen: s.pullLen })),
+      channelC_samples: channelSamples.map(s => ({ relMs: s.relMs, transcriptLines: s.transcriptLines })),
+    }, null, 2));
+
+    // ── 断言 ──
+    expect(res.events.length).toBeGreaterThan(0);
+    const channels = [
+      res.deltaStats.subagentAssistantMsgs > 0,
+      pullValid.length > 0,
+      transcriptValid.length > 0,
+    ];
+    console.error(`[H6] 可用通道数=${channels.filter(Boolean).length}/3`);
+    if (!channels.some(Boolean)) {
+      console.error('[否定发现] 三通道全不可用 —— 本轮未触发真实 subagent 或本地网关限制，如实记录');
+    } else {
+      console.error('[发现] 至少一条实时增量通道可用，见 H5 小结');
     }
   }, 240000);
 });
