@@ -4733,6 +4733,170 @@ describe('close() 生命周期', () => {
     // 迭代器最终应结束（不挂死）
     expect(state.iteratorEndedAt).not.toBeNull();
   }, 120000);
+
+  // ── case-27b：用 PID 硬观测 close 后后台进程是否变孤儿 ──
+  //
+  // case-27 用 .output 文件推断孤儿失败（文件在观测窗口内没生成）。case-29 探明后台 bash
+  // 跑在 git-bash(MSYS2) 里，$$/ps/kill 全可用。故本 case 让命令把自己的 PID 写到已知文件，
+  // close() 后【独立用 ps -p <pid> 探活】——进程要么在要么不在，是硬观测，不依赖 .output。
+  //
+  // 命令：echo $$ > <pidfile>; sleep 60; echo done > <donefile>
+  //   · pidfile 立即写 → 测试读到真实 PID
+  //   · sleep 60 给足观测窗口（close 后持续探活 ~15s）
+  //   · 若 close 后进程仍存活（ps -p 命中）→ 孤儿；若消失 → 被 SDK 回收
+  it('case-27b close() 后用 PID 探活判断后台进程是否孤儿', async () => {
+    const dir = createTimestampDir('tool-foreground-background/case-27b-pid-orphan');
+    const { join } = await import('path');
+    const { execSync } = await import('child_process');
+
+    // 用 posix 风格路径（git-bash 命令里用），pidfile 放测试 tmp 目录
+    const pidFilePosix = `${dir.replace(/\\/g, '/').replace(/^([A-Za-z]):/, '/$1')}/bg27b.pid`;
+    const pidFileWin = join(dir, 'bg27b.pid');
+    const BG_CMD_27B = `echo $$ > "${pidFilePosix}"; sleep 60; echo done`;
+
+    const state = {
+      queryStartedAt: Date.now(),
+      bashTaskId: null as string | null,
+      taskStartedAt: null as number | null,
+      closeCalledAt: null as number | null,
+      bgPid: null as string | null,
+      iteratorEndedAt: null as number | null,
+    };
+    // 进程存活探测快照：{ t, phase(before/after close), pidKnown, alive }
+    const aliveSnaps: { t: number; afterClose: boolean; pid: string | null; alive: boolean | null }[] = [];
+
+    function probeAlive(pid: string | null): boolean | null {
+      if (!pid) return null;
+      try {
+        // git-bash 的 ps -p <pid>：命中返回 0（有该行），否则非 0
+        const out = execSync(`ps -p ${pid}`, { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] });
+        return out.split('\n').some(l => new RegExp(`\\b${pid}\\b`).test(l));
+      } catch {
+        return false; // ps -p 未命中 → 进程已不在
+      }
+    }
+
+    const events: CapturedSDKEvent[] = [];
+    const msg1: any = {
+      type: 'user',
+      message: { role: 'user', content: `Use the Bash tool to run this exact command in the BACKGROUND (set run_in_background to true): ${BG_CMD_27B}` },
+      parent_tool_use_id: null,
+    };
+    async function* promptInput(): AsyncIterable<any> {
+      yield msg1;
+      await new Promise<void>(() => {}); // 挂住输入流，直到 close
+    }
+
+    const env = { ...BASE_ENV, OTEL_LOG_RAW_API_BODIES: `file:${dir}` };
+    const sdkQuery = query({
+      prompt: promptInput(),
+      options: { env, includePartialMessages: true, persistSession: false, settingSources: [], effort: 'low', permissionMode: 'bypassPermissions' } as any,
+    });
+    const queryHandle: any = sdkQuery;
+
+    // 每秒：先读 pidfile 拿 PID，再探活
+    const poller = setInterval(() => {
+      const t = Date.now() - state.queryStartedAt;
+      if (!state.bgPid && existsSync(pidFileWin)) {
+        try {
+          const raw = readFileSync(pidFileWin, 'utf-8').trim();
+          if (/^\d+$/.test(raw)) { state.bgPid = raw; console.error(`\n[${t}ms] 读到后台 bash PID=${raw}`); }
+        } catch {}
+      }
+      const alive = probeAlive(state.bgPid);
+      aliveSnaps.push({ t, afterClose: state.closeCalledAt != null, pid: state.bgPid, alive });
+      console.error(`[probe t=${t}ms] afterClose=${state.closeCalledAt != null} pid=${state.bgPid ?? '-'} alive=${alive}`);
+    }, 1000);
+
+    let index = 0;
+    let closeAtIterations = 0;
+    try {
+      for await (const message of sdkQuery) {
+        const msg = message as any;
+        const type = msg.type || 'unknown';
+        const rel = Date.now() - state.queryStartedAt;
+        const captured: CapturedSDKEvent = { index: index++, type, timestamp: Date.now() };
+
+        if (type === 'system') {
+          captured.subtype = msg.subtype;
+          if (msg.subtype === 'task_started' && !state.bashTaskId) {
+            state.bashTaskId = msg.task_id;
+            state.taskStartedAt = rel;
+            console.error(`\n[${rel}ms] task_started task_id=${msg.task_id}`);
+          }
+        }
+        events.push(captured);
+
+        // 等 task_started + 已读到 PID 后再 close（确保 close 前 PID 已知）；
+        // 若迟迟没拿到 PID，最多等 6 次迭代后也强制 close
+        if (state.bashTaskId && state.closeCalledAt == null) {
+          closeAtIterations++;
+          if (state.bgPid || closeAtIterations > 6) {
+            // close 前先探活一次（基线：close 前进程应存活）
+            const beforeAlive = probeAlive(state.bgPid);
+            aliveSnaps.push({ t: rel, afterClose: false, pid: state.bgPid, alive: beforeAlive });
+            console.error(`\n[close 前基线] pid=${state.bgPid} alive=${beforeAlive}`);
+            state.closeCalledAt = rel;
+            console.error(`[close] 调用 close() @ ${rel}ms`);
+            queryHandle.close();
+          }
+        }
+      }
+      state.iteratorEndedAt = Date.now() - state.queryStartedAt;
+    } catch (e: any) {
+      state.iteratorEndedAt = Date.now() - state.queryStartedAt;
+      console.error(`[iterator] 抛出 @ ${state.iteratorEndedAt}ms: ${e?.message || e}`);
+    }
+
+    // close 后继续探活 ~15s（迭代器已结束，但进程可能还活着 = 孤儿）
+    console.error(`\n[close 后持续探活 15s...]`);
+    for (let i = 0; i < 15; i++) {
+      await new Promise(r => setTimeout(r, 1000));
+      const t = Date.now() - state.queryStartedAt;
+      if (!state.bgPid && existsSync(pidFileWin)) {
+        try { const raw = readFileSync(pidFileWin, 'utf-8').trim(); if (/^\d+$/.test(raw)) state.bgPid = raw; } catch {}
+      }
+      const alive = probeAlive(state.bgPid);
+      aliveSnaps.push({ t, afterClose: true, pid: state.bgPid, alive });
+      console.error(`[probe(post) t=${t}ms] pid=${state.bgPid ?? '-'} alive=${alive}`);
+    }
+    clearInterval(poller);
+
+    const duration = Date.now() - state.queryStartedAt;
+
+    // 分析：close 后进程是否仍存活
+    const afterCloseSnaps = aliveSnaps.filter(s => s.afterClose && s.pid);
+    const stillAliveAfterClose = afterCloseSnaps.some(s => s.alive === true);
+    const aliveBeforeClose = aliveSnaps.some(s => !s.afterClose && s.alive === true);
+    // 最后一次探活结果
+    const lastAlive = afterCloseSnaps.length ? afterCloseSnaps[afterCloseSnaps.length - 1].alive : null;
+
+    console.error('\n══════ P1-P4 实测值（PID 孤儿判断）══════');
+    console.error(`[P1] 后台 bash PID: ${state.bgPid ?? '(未读到 pidfile)'}`);
+    console.error(`[P2] close 前进程存活: ${aliveBeforeClose}（基线，应为 true）`);
+    console.error(`[P3] close 后是否仍存活过: ${stillAliveAfterClose}；最后一次探活=${lastAlive}`);
+    console.error(`[P4] 结论: ${state.bgPid == null ? '⚠️ 未拿到 PID，无法判断' : stillAliveAfterClose ? '❗孤儿——close 后进程仍在跑' : '✅ 进程被回收——close 后进程消失'}`);
+    console.error(`[close@${state.closeCalledAt}ms 迭代器结束@${state.iteratorEndedAt}ms 总耗时${duration}ms]`);
+
+    // 清理：若进程仍活着，杀掉避免残留
+    if (state.bgPid && lastAlive) {
+      try { execSync(`kill ${state.bgPid}`, { stdio: 'ignore' }); console.error(`[cleanup] 已 kill 残留进程 ${state.bgPid}`); } catch {}
+    }
+
+    writeFileSync(`${dir}/sdk-events.json`, JSON.stringify(events, null, 2));
+    writeFileSync(`${dir}/pid-orphan.json`, JSON.stringify({
+      bgPid: state.bgPid, bashTaskId: state.bashTaskId, taskStartedAt: state.taskStartedAt,
+      closeCalledAt: state.closeCalledAt, iteratorEndedAt: state.iteratorEndedAt,
+      aliveBeforeClose, stillAliveAfterClose, lastAlive, aliveSnaps, duration,
+    }, null, 2));
+
+    // ── 断言 ──
+    expect(events.length).toBeGreaterThan(0);
+    expect(state.closeCalledAt).not.toBeNull();
+    if (state.bgPid == null) {
+      console.error('[否定发现] 未从 pidfile 读到 PID —— 命令可能没按指令跑/pidfile 路径不对，孤儿判断未能完成');
+    }
+  }, 120000);
 });
 
 // ====== 尝试触发 paused 状态（case-28，探索性）======
@@ -4940,6 +5104,138 @@ describe('尝试触发 paused 状态', () => {
     // 结构断言：若有 task_updated，每条 patch 必是对象
     for (const s of state.patchSnaps) {
       expect(typeof s.patch).toBe('object');
+    }
+  }, 120000);
+});
+
+// ====== 后台 bash 的 shell 环境探测（case-29，为 PID 观测方案定型）======
+//
+// 缘起：case-27 想判断 close() 后后台 bash 进程是否变孤儿，但用 .output 文件推断失败
+// （文件在观测窗口内没生成）。更硬的观测手段是【PID 存活探测】，但 SDK 完全不暴露 PID
+// （sdk.d.ts 无 pid 字段，BackgroundTaskSummary 也没有）。要从 OS 层拿 PID，先得知道
+// 后台 bash 到底在【哪个 shell】里跑、sleep/ps/wmic 是否可用、$$ 能否拿到 PID。
+//
+// 本 case 让后台 bash 跑一条【自暴露环境】的命令，把 shell 身份信息 echo 出来，从
+// tool_result / .output 文件读回观测：
+//   E1 uname -a → 是否 Linux(WSL)/MSYS(git-bash)/不可用(cmd)
+//   E2 echo $$ → 能否拿到 bash 进程自己的 PID
+//   E3 echo $SHELL / $0 → shell 路径
+//   E4 which ps / which wmic → 后续探活用哪个命令
+// 观测结果决定 case-27b 用什么方式做 PID 存活探测（ps -p / kill -0 / wmic）。
+
+describe('后台 bash shell 环境探测', () => {
+  // 一条命令自暴露：shell 类型、自身 PID、可用探活工具。用唯一标记便于反查。
+  const PROBE_MARKER = 'BG29PROBE';
+  const PROBE_CMD = `echo "MARKER=${PROBE_MARKER}"; echo "UNAME=$(uname -a 2>/dev/null || echo NO_UNAME)"; echo "PID=$$"; echo "SHELL_VAR=$SHELL"; echo "ARG0=$0"; echo "HAS_PS=$(command -v ps || echo NO_PS)"; echo "HAS_KILL=$(command -v kill || echo NO_KILL)"; echo "HAS_WMIC=$(command -v wmic || echo NO_WMIC)"; echo "PROBE_DONE"`;
+
+  it('case-29 后台 bash 自暴露 shell/PID/探活工具', async () => {
+    const dir = createTimestampDir('tool-foreground-background/case-29-shell-probe');
+
+    const t0 = Date.now();
+    const state = {
+      bashTaskId: null as string | null,
+      sessionId: null as string | null,
+      outputFile: null as string | null,
+      probeText: '' as string,       // 从 tool_result / .output 收集到的探测输出
+      parsed: {} as Record<string, string>,
+      queryEnded: false,
+    };
+
+    // 每秒尝试读 .output 文件，累积探测输出
+    const poller = setInterval(() => {
+      const cands: string[] = [];
+      if (state.outputFile) cands.push(state.outputFile);
+      for (const p of cands) {
+        if (existsSync(p)) {
+          try {
+            const c = readFileSync(p, 'utf-8');
+            if (c.includes(PROBE_MARKER) && c.length > state.probeText.length) state.probeText = c;
+          } catch { /* 正被写 */ }
+        }
+      }
+    }, 1000);
+
+    const env = { ...BASE_ENV, OTEL_LOG_RAW_API_BODIES: `file:${dir}` };
+    const sdkQuery = query({
+      prompt: `Use the Bash tool to run this exact command in the FOREGROUND (do NOT set run_in_background): ${PROBE_CMD}`,
+      options: { env, includePartialMessages: true, persistSession: false, settingSources: [], effort: 'low', permissionMode: 'bypassPermissions' } as any,
+    });
+
+    const events: CapturedSDKEvent[] = [];
+    let index = 0;
+    try {
+      for await (const message of sdkQuery) {
+        const msg = message as any;
+        const type = msg.type || 'unknown';
+        const rel = Date.now() - t0;
+        const captured: CapturedSDKEvent = { index: index++, type, timestamp: Date.now() };
+
+        if (type === 'system') {
+          captured.subtype = msg.subtype;
+          if (msg.subtype === 'init' && msg.session_id) state.sessionId = state.sessionId || msg.session_id;
+          if (msg.subtype === 'task_started' && !state.bashTaskId) {
+            state.bashTaskId = msg.task_id;
+            state.sessionId = state.sessionId || msg.session_id || null;
+            console.error(`\n[${rel}ms] task_started task_id=${msg.task_id}`);
+          }
+          if (msg.subtype === 'task_notification' && msg.output_file) {
+            state.outputFile = msg.output_file;
+          }
+        }
+
+        // 从 tool_result 收集探测输出（前台命令 stdout 一次性带回）
+        if (type === 'user') {
+          const cb = Array.isArray(msg.message?.content) ? msg.message.content : [];
+          for (const b of cb) {
+            if (b.type === 'tool_result') {
+              const snippet = typeof b.content === 'string' ? b.content
+                : Array.isArray(b.content) ? b.content.map((c: any) => (c.type === 'text' ? c.text : '')).join('') : '';
+              if (snippet.includes(PROBE_MARKER) && snippet.length > state.probeText.length) state.probeText = snippet;
+              // stdout 可能包在 JSON 里
+              const sm = snippet.match(/"stdout"\s*:\s*"([\s\S]*?)"\s*,\s*"stderr"/);
+              if (sm) {
+                const decoded = sm[1].replace(/\\n/g, '\n').replace(/\\"/g, '"');
+                if (decoded.includes(PROBE_MARKER) && decoded.length > state.probeText.length) state.probeText = decoded;
+              }
+            }
+          }
+        }
+
+        if (type === 'result') { state.queryEnded = true; }
+        events.push(captured);
+      }
+    } finally {
+      clearInterval(poller);
+    }
+
+    const duration = Date.now() - t0;
+
+    // 解析探测输出的各字段
+    for (const line of state.probeText.split(/\r?\n/)) {
+      const m = line.match(/^(MARKER|UNAME|PID|SHELL_VAR|ARG0|HAS_PS|HAS_KILL|HAS_WMIC)=(.*)$/);
+      if (m) state.parsed[m[1]] = m[2];
+    }
+
+    console.error('\n══════ E1-E4 shell 环境探测实测值 ══════');
+    console.error(`[原始探测输出]:\n${state.probeText || '(未收集到 —— 见下方否定发现)'}`);
+    console.error(`[E1] UNAME: ${state.parsed.UNAME ?? '(无)'}  → 判定 shell 类型`);
+    console.error(`[E2] PID (bash $$): ${state.parsed.PID ?? '(无)'}  → 能否拿到后台 bash 自身 PID`);
+    console.error(`[E3] SHELL_VAR=${state.parsed.SHELL_VAR ?? '(无)'} ARG0=${state.parsed.ARG0 ?? '(无)'}`);
+    console.error(`[E4] 探活工具: ps=${state.parsed.HAS_PS ?? '?'} kill=${state.parsed.HAS_KILL ?? '?'} wmic=${state.parsed.HAS_WMIC ?? '?'}`);
+
+    writeFileSync(`${dir}/sdk-events.json`, JSON.stringify(events, null, 2));
+    writeFileSync(`${dir}/shell-probe.json`, JSON.stringify({
+      probeText: state.probeText, parsed: state.parsed,
+      bashTaskId: state.bashTaskId, sessionId: state.sessionId, outputFile: state.outputFile,
+      queryEnded: state.queryEnded, duration,
+    }, null, 2));
+
+    // ── 断言（探索性）──
+    expect(events.length).toBeGreaterThan(0);
+    if (!state.probeText.includes(PROBE_MARKER)) {
+      console.error('[否定发现] 未收集到探测输出（LLM 可能没按指令跑命令，或 stdout 未回传）—— 需检查 tool_result/.output');
+    } else {
+      console.error(`[结论] 后台 bash shell 环境已探明，PID 可获取性=${state.parsed.PID && /^\d+$/.test(state.parsed.PID) ? '可' : '不可'}`);
     }
   }, 120000);
 });

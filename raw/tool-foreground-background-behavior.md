@@ -41,6 +41,9 @@
 | 71 | **自动后台化任务转后台后 tool_result 带 `backgroundTaskId`（== task_id）**，第一轮 turn 立即结束（13.4s，未等满 sleep 40），可 streaming 续轮边聊 | Case 25 |
 | 72 | **显式后台 bash（run_in_background:true）能被 `stopTask` 终止**：dual-channel `task_updated.status=killed` + `task_notification.status=stopped`（相差 ~1ms），sleep 40 被真正中断 | Case 26 |
 | 73 | **`close()` 立即终止 query 迭代器**（~2s 内 for-await 退出），close 后【不再收到任何消息】——无 task_notification、无 result | Case 27 |
+| 75 | **后台 bash 跑在 git-bash(MSYS2) 里**，`$$`/`ps`/`kill`/`wmic` 全可用；SDK 不暴露 PID，须让命令 `echo $$` 自暴露 | Case 29 |
+| 76 | **`close()` 后后台 bash 进程【变孤儿、不被回收】** —— PID 硬观测：close 后持续 19s 每次 `ps -p` 探活均存活 | Case 27b |
+| 77 | **关闭会话必须先 `stopTask` 再 `close`** —— 否则后台进程成孤儿继续跑到自然结束（case-26 证明 stopTask 能真正杀进程） | Case 27b |
 | 74 | **`paused` 状态仍无法在 SDK query 层触发** —— backgroundTasks+interrupt+stopTask 组合只跑出 killed，未见 paused（补强 case-21 发现 58） | Case 28 |
 
 ---
@@ -486,7 +489,7 @@ SDK 注释（`sdk.d.ts:2496`）说返回 `false` 仅当「给了 toolUseId 但�
 7. **`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` 的真实影响范围** — 需要更精确的控制变量实验
 8. **长运行后台任务的 task_notification completed 状态** — case-2 因超时未等到 completed；case-12/13 已观测到 completed（但 output_file 为空）
 9. ~~**嵌套 subagent 的 id 父子链**~~ — **已验证（case-24，2026-07-25）**：subagent 内部 `assistant.parent_tool_use_id` == 外层 `Agent block.id` == `task_started.tool_use_id`（三者全等，见发现 68-69）
-10. ~~**close() 生命周期**~~ — **已验证（case-27，2026-07-25）**：close() 同步终止迭代器（~2s），之后不再收到任何消息（见发现 73）。剩余不确定点：close() 是否 100% 回收派生的后台进程（本 case 未拿到 output_file 逐秒验证）。
+10. ~~**close() 生命周期**~~ — **已验证（case-27 + 27b，2026-07-25）**：close() 同步终止迭代器（~2s），之后不再收到任何消息（发现 73）。**孤儿问题已由 case-27b 用 PID 硬观测钉死**：close() 后后台 bash 进程不被回收、持续存活 19s+（发现 76）。关闭会话必须先 stopTask 再 close（发现 77）。
 11. **`paused` 状态触发路径** — case-21/28 均未在 SDK query 层触发到；推断仅 TUI 暂停/workflow 挂起场景产生。需查 CLI/TUI 源码坐实（见发现 74）
 12. **显式后台 bash 的 stopTask 终止** — **已验证（case-26，2026-07-25）**：run_in_background:true 的任务可被 stopTask 杀掉（killed+stopped 双通道，见发现 72）
 
@@ -998,9 +1001,41 @@ streaming-input 起显式后台 bash（sleep 40），等 task_started 后调 `qu
 - close() 是**同步方法**（返回 void，不抛错）。
 - 调用后 for-await 在 ~2s 内正常结束（非抛错退出）。
 - **close 后彻底静默**：没有 task_notification（后台任务的终结信号收不到）、没有 result 消息。
-- 本 case 因 close 发生在 task_started 时刻（output_file 路径尚未通过 notification/tool_result 送达），未能拿到 output_file 路径，故无法直接观测"后台进程是否变孤儿"。
+- 本 case 曾尝试用 `.output` 文件推断"后台进程是否变孤儿"，但文件在观测窗口内未生成（10 次快照全 `exists:false`），**该观测手段失败**。→ 已由 **case-27b 用 PID 硬观测补上**（见下），结论：**close 后进程变孤儿、不被回收**。
 
-> ⚠️ **孤儿任务问题部分未决**：close() 会"forcefully ends the query, cleaning up all resources including ... the CLI subprocess"（sdk.d.ts:2513-2515）。CLI 子进程被杀，其派生的后台 bash 进程**理论上**应随之终止（进程树），但本 case 未拿到 output_file 无法逐秒验证文件是否停止增长。**对 CodePilot 的建议**：关闭会话若想干净停掉后台任务，优先显式 `stopTask(taskId)`（case-26 已证能杀）再 `close()`，不要指望 close() 单独保证后台进程被回收。
+> ✅ **孤儿任务问题已钉死（case-27b PID 硬观测）**：SDK 文档说 close() "forcefully ends the query, cleaning up all resources including ... the CLI subprocess"（sdk.d.ts:2513-2515）。但**实测推翻了"进程树随之终止"的理论推断** —— case-27b 用 `ps -p <pid>` 硬观测证明：close 后后台 bash 进程持续存活 19s（每次探活均命中），**变成孤儿、不被回收**。**对 CodePilot 的建议（已从推断升级为硬结论）**：关闭会话前必须先 `stopTask(taskId)`（case-26 已证能真杀进程）再 `close()`，绝不能指望 close() 回收后台进程。
+
+### case-29：后台 bash shell 环境探测（为 PID 观测方案定型）
+
+case-27 用 `.output` 文件推断孤儿失败后，改用更硬的 **PID 存活探测**。但 SDK 完全不暴露 PID（`sdk.d.ts` 无 pid 字段，`BackgroundTaskSummary` 也没有），须从 OS 层拿。本 case 让后台 bash 跑一条自暴露环境的命令，观测它在哪个 shell、能否拿 PID、有哪些探活工具。
+
+| # | 发现 | 证据（case-29 实测） |
+|---|------|---------------------|
+| 75 | **后台 bash 跑在 git-bash(MSYS2) 里**，非 WSL、非 cmd | `UNAME=MINGW64_NT-10.0 ... Msys`；`SHELL_VAR=/bin/bash.exe`；`ARG0=/usr/bin/bash` |
+| — | **`$$` 能拿到 bash 自身 PID**（纯数字） | `PID=23628` |
+| — | **`ps`/`kill`/`wmic` 全可用** | `HAS_PS=/usr/bin/ps`、`HAS_KILL=kill`、`HAS_WMIC=/c/Windows/System32/Wbem/wmic` |
+
+**结论**：后台 bash 在 git-bash 里跑，`echo $$` 自暴露 PID + `ps -p <pid>` 探活是可行的硬观测方案 → 直接支撑 case-27b。
+
+### case-27b：用 PID 硬观测 close 后进程是否孤儿
+
+命令 `echo $$ > <pidfile>; sleep 60; echo done` 让后台 bash 把自己的 PID 写到已知文件；测试读到 PID 后调 `close()`，然后**独立用 `ps -p <pid>` 持续探活 19s**。
+
+| # | 发现 | 证据（case-27b 实测） |
+|---|------|---------------------|
+| 76 | **close() 后后台进程变孤儿、不被回收** | PID=`23746`；close@14442ms、迭代器结束@16594ms；close 后 15171→33498ms 共 36 次 `ps -p` 探活**全部 alive=true** |
+| 77 | **close 前基线正确**：进程 close 前确实存活 | `aliveBeforeClose:true` |
+
+**关键时间线（case-27b）**：
+```
+t+11112ms  task_started（后台 bash PID=23746 已写入 pidfile）
+t+14442ms  close() 调用（close 前基线探活 alive=true）
+t+16594ms  for-await 迭代器结束
+t+15171ms ~ 33498ms  close 后持续探活 19s —— ps -p 23746 每次都命中，alive=true
+（测试结尾 kill 23746 清理孤儿进程）
+```
+
+**结论**：`close()` 只关闭 SDK 的 query 迭代器和通信通道，**不终止它启动的后台 bash 进程**。该进程脱离 query 成为孤儿，继续跑到命令自然结束。这是**硬观测**（PID 探活），非文件推断。
 
 ### case-28：尝试触发 paused 状态（探索性，否定发现）
 
@@ -1020,5 +1055,5 @@ streaming-input 起显式后台 bash（sleep 40），等 task_started 后调 `qu
 1. **subagent 消息归属用 parent_tool_use_id**（case-24）：subagent 内部所有消息的 `parent_tool_use_id` 都指向外层 `Agent tool_use block.id`（也等于 `task_started.tool_use_id`）。用它建 tool_use 树，把 subagent 内部的 Bash/文本正确挂到发起它的 Agent 节点下。
 2. **"边聊边等后台"首选 backgroundTasks 而非 interrupt**（case-25）：自动后台化的长命令阻塞，等 task_started 后调 `backgroundTasks(tool_use_id)` 即解除，turn 立即结束、可续轮问 AI，后台任务继续跑。interrupt 会打断整个 turn，不适合"转后台继续聊"。
 3. **停后台任务 backgroundTasks 与 stopTask 都要等 task_started**（case-26，铁律再确认）：显式后台任务用 `stopTask(taskId)` 能干净杀掉（killed+stopped 双通道），与被后台化的前台任务行为一致。渲染时两通道去重。
-4. **关闭会话 = 先 stopTask 再 close**（case-27）：close() 同步终止 query、之后彻底静默（无 notification/result）。想干净停后台任务，先显式 stopTask 再 close，不要只靠 close() 回收后台进程。
+4. **关闭会话必须先 stopTask 再 close**（case-27 + 27b，硬结论）：close() 同步终止 query、之后彻底静默（无 notification/result），**但不回收后台进程** —— case-27b 用 PID 探活证明 close 后后台 bash 存活 19s+，变孤儿。所以想干净停后台任务，**必须先 `stopTask(taskId)`（case-26 证明能真杀进程）再 `close()`**，不能只靠 close()。
 5. **不要期待 paused 状态**（case-28）：SDK query 层跑不出 paused，状态机 UI 只需处理 pending/running/completed/failed/killed/stopped，paused 可暂不实现（或标注"仅 TUI/workflow"）。
