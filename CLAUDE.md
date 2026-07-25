@@ -26,3 +26,7 @@ REST API 服务，将 `@anthropic-ai/claude-agent-sdk` 封装为 HTTP 接口。
 - `claude-agent-sdk` `0.3.220`
 - `claude-code` `2.1.218`
 - `claude-code-docs` 子模块：`2026-07-25`（commit `fcfa378e`）
+
+## 命令执行约定
+
+- **禁止在 bash 命令中使用 `tail`**（以及 `head` 等截断输出的管道）——会导致看不到命令的完整过程和中间信息，掩盖真实执行情况。需要查看输出时，用 `Read` 工具读输出文件，或用 `grep` 精确取行，而不是截断。
