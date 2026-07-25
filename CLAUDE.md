@@ -27,6 +27,9 @@ REST API 服务，将 `@anthropic-ai/claude-agent-sdk` 封装为 HTTP 接口。
 - `claude-code` `2.1.218`
 - `claude-code-docs` 子模块：`2026-07-25`（commit `fcfa378e`）
 
+**npm 镜像源**：项目根 `.npmrc` 固定使用淘宝镜像 `https://registry.npmmirror.com`。原因：`claude-agent-sdk` 的平台原生二进制包（如 `claude-agent-sdk-win32-x64`，解压后约 265MB）在公司私有源上下载极慢/下不动，换淘宝镜像可正常拉取。`package-lock.json` 中相关包的 `resolved` 地址也已指向淘宝镜像。
+
 ## 命令执行约定
 
-- **禁止在 bash 命令中使用 `tail`**（以及 `head` 等截断输出的管道）——会导致看不到命令的完整过程和中间信息，掩盖真实执行情况。需要查看输出时，用 `Read` 工具读输出文件，或用 `grep` 精确取行，而不是截断。
+- **禁止对命令输出使用 `tail`/`head` 截断**——运行命令（如 `npm install`、测试、构建）时用 `... | tail` / `| head` 会看不到完整过程和中间信息，掩盖真实执行情况。让命令输出完整落到日志文件（`> /tmp/xxx.log 2>&1`），再用其它方式查看。
+- **读取已有文件时可以用 `tail`/`head`**——对日志文件、输出文件做 `tail -n`、`head -n` 查看是允许的；也可用 `Read` 工具或 `grep` 精确取行。区别在于：截断的是"正在运行的命令的实时输出"（禁止）还是"已落盘文件的内容"（允许）。
