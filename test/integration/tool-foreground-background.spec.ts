@@ -5239,3 +5239,682 @@ describe('后台 bash shell 环境探测', () => {
     }
   }, 120000);
 });
+
+// ══════════════════════════════════════════════════════════════════
+// 新研究课题：subagent（Agent 工具启动的子代理）全生命周期 + 实时增量信息
+// 阶段一（子问题1：subagent 是不是工具调用机制）+ 阶段二（子问题2：前后台）
+//
+// case-30 Agent vs Bash tool_use 骨架对照
+// case-31 run_in_background 显式对照（前台阻塞 vs 后台异步）
+// case-32 默认行为（读 Agent input.run_in_background 默认值，复验 case-5）
+// case-33 backgroundTasks/stopTask 对 local_agent 是否生效（关键补白）
+//
+// 环境决策：主用智谱 GLM（BIGMODEL_ENV，glm-5.2）——它能稳定触发真实 subagent；
+// 本地 Jereh-LLM 触发不稳定（曾因 "Content block not found" skip），关键 case
+// 可用 BASE_ENV 对照，触发不到就如实记否定发现。
+//
+// 沿用 case-13→17 铁律：控制方法（backgroundTasks/stopTask）必须在收到 task_started
+// 事件【之后】调用才生效。
+// ══════════════════════════════════════════════════════════════════
+
+/**
+ * 通用：用指定 env 跑一次 query，收集事件 + 每条 assistant 的 parent_tool_use_id/subagent_type。
+ * 与 collectSDKEvents 的区别：显式接受 env（不强制 BASE_ENV），并额外抓 subagent 关联字段。
+ */
+async function collectSubagentEvents(options: {
+  prompt: string;
+  env: Record<string, string | undefined>;
+  logDir: string;
+}): Promise<{
+  events: CapturedSDKEvent[];
+  assistantSnaps: {
+    relMs: number;
+    parent_tool_use_id: string | null;
+    subagent_type: string | null;
+    task_description: string | null;
+    toolUses: { name: string; id: string }[];
+  }[];
+  duration: number;
+}> {
+  const t0 = Date.now();
+  const events: CapturedSDKEvent[] = [];
+  const assistantSnaps: any[] = [];
+  let index = 0;
+
+  const env = { ...options.env, OTEL_LOG_RAW_API_BODIES: `file:${options.logDir}` };
+  const sdkQuery = query({
+    prompt: options.prompt,
+    options: {
+      env,
+      includePartialMessages: true,
+      persistSession: false,
+      settingSources: [],
+      effort: 'low',
+      permissionMode: 'bypassPermissions',
+    } as any,
+  });
+
+  for await (const message of sdkQuery) {
+    const msg = message as any;
+    const type = msg.type || 'unknown';
+    const rel = Date.now() - t0;
+    const captured: CapturedSDKEvent = { index: index++, type, timestamp: Date.now() };
+
+    if (type === 'stream_event' && msg.event) {
+      const evt = msg.event;
+      captured.eventType = evt.type;
+      if (evt.type === 'content_block_start' && evt.content_block?.type === 'tool_use') {
+        captured.toolName = evt.content_block.name;
+        captured.toolUseId = evt.content_block.id;
+      }
+      if (evt.type === 'content_block_delta' && evt.delta?.type === 'input_json_delta') {
+        captured.deltaType = 'input_json_delta';
+        captured.inputJsonSnippet = evt.delta.partial_json;
+      }
+      if (evt.type === 'content_block_delta' && evt.delta?.type === 'text_delta') {
+        process.stderr.write(evt.delta.text);
+      }
+    }
+
+    if (type === 'system') {
+      captured.subtype = msg.subtype;
+      if (msg.subtype === 'task_started') {
+        captured.taskId = msg.task_id;
+        captured.taskType = msg.task_type;
+        captured.raw = { ...msg };
+      }
+      if (msg.subtype === 'task_notification') {
+        captured.taskId = msg.task_id;
+        captured.taskStatus = msg.status;
+        captured.taskType = msg.task_type;
+        captured.raw = {
+          task_id: msg.task_id, status: msg.status, summary: msg.summary,
+          error: msg.error, output_file: msg.output_file, task_type: msg.task_type,
+          usage: msg.usage, tool_use_id: msg.tool_use_id,
+        };
+      }
+      if (msg.subtype === 'task_progress') {
+        captured.taskId = msg.task_id;
+        captured.taskType = msg.task_type;
+        captured.raw = { subagent_type: msg.subagent_type, last_tool_name: msg.last_tool_name, usage: msg.usage };
+      }
+    }
+
+    if (type === 'assistant' && msg.message?.content) {
+      const toolUses: { name: string; id: string }[] = [];
+      for (const block of msg.message.content) {
+        if (block.type === 'tool_use') {
+          toolUses.push({ name: block.name, id: block.id });
+          captured.toolName = block.name;
+          captured.toolUseId = block.id;
+          if (!captured.raw) captured.raw = {};
+          captured.raw.toolInput = block.input;
+        }
+      }
+      assistantSnaps.push({
+        relMs: rel,
+        parent_tool_use_id: msg.parent_tool_use_id ?? null,
+        subagent_type: msg.subagent_type ?? null,
+        task_description: msg.task_description ?? null,
+        toolUses,
+      });
+    }
+
+    if (type === 'user') {
+      captured.raw = {
+        parent_tool_use_id: msg.parent_tool_use_id,
+        messageContentTypes: Array.isArray(msg.message?.content)
+          ? msg.message.content.map((b: any) => ({ type: b.type, tool_use_id: b.tool_use_id }))
+          : undefined,
+      };
+    }
+
+    if (type === 'result') {
+      captured.raw = { subtype: msg.subtype, num_turns: msg.num_turns };
+    }
+
+    events.push(captured);
+  }
+
+  return { events, assistantSnaps, duration: Date.now() - t0 };
+}
+
+/** 统计一次 run 的 tool_use 骨架：content_block_start(tool_use) / input_json_delta / content_block_stop / tool_result */
+function analyzeToolUseSkeleton(events: CapturedSDKEvent[], toolName: string) {
+  // 找该工具的 content_block_start
+  const starts = events.filter(e => e.type === 'stream_event' && e.eventType === 'content_block_start' && e.toolName === toolName);
+  // input_json_delta 次数（全局，仅一个工具时够用）
+  const inputJsonDeltas = events.filter(e => e.deltaType === 'input_json_delta');
+  const contentBlockStops = events.filter(e => e.type === 'stream_event' && e.eventType === 'content_block_stop');
+  // assistant 里出现该工具的 tool_use（拿最终 input）
+  const assistantToolUse = events.filter(e => e.type === 'assistant' && e.toolName === toolName && e.raw?.toolInput);
+  // user tool_result
+  const toolResults = events.filter(e => e.type === 'user' && Array.isArray(e.raw?.messageContentTypes)
+    && e.raw.messageContentTypes.some((b: any) => b.type === 'tool_result'));
+  return {
+    hasContentBlockStart: starts.length > 0,
+    contentBlockStartCount: starts.length,
+    inputJsonDeltaCount: inputJsonDeltas.length,
+    contentBlockStopCount: contentBlockStops.length,
+    hasToolResult: toolResults.length > 0,
+    finalInput: assistantToolUse[0]?.raw?.toolInput ?? null,
+    finalInputKeys: assistantToolUse[0]?.raw?.toolInput ? Object.keys(assistantToolUse[0].raw.toolInput) : [],
+  };
+}
+
+// ====== case-30 Agent vs Bash tool_use 骨架对照 ======
+//
+// 子问题1：subagent 是不是工具调用机制？
+// 同一批 prompt 分别触发一次 Bash 和一次 Agent，验证 Agent 走与 Bash 相同的工具调用骨架：
+//   content_block_start(tool_use) → input_json_delta → content_block_stop → tool_result
+// 断言：
+//   · 两者都有 tool_use（content_block_start）和 tool_result（user 消息）
+//   · Agent 的 input_json_delta 逐步拼出 6 字段之一部分（description/prompt/subagent_type/
+//     model/run_in_background/isolation）
+//   · 差异仅在 Agent 伴随 task_started(task_type=local_agent)，Bash 是 local_bash（或无）
+// 主用 GLM（稳定触发真实 subagent），本地 BASE_ENV 对照记差异。
+
+describe('subagent 阶段一: Agent vs Bash tool_use 骨架对照', () => {
+  const BASH_PROMPT = 'Use the Bash tool to run the command "echo skeleton-bash-30". Then tell me the output.';
+  const AGENT_PROMPT = 'Use the Agent tool to launch a subagent whose task is to run the Bash command "echo skeleton-agent-30" and report its output. Wait for the subagent and tell me its result.';
+
+  it('case-30 Agent 与 Bash 共享 tool_use 骨架，差异仅在 task_type', async () => {
+    const dirBash = createTimestampDir('tool-foreground-background/case-30-bash-skeleton');
+    const dirAgent = createTimestampDir('tool-foreground-background/case-30-agent-skeleton');
+
+    // ── Run 1: Bash（GLM）──
+    const bashRun = await collectSubagentEvents({ prompt: BASH_PROMPT, env: BIGMODEL_ENV, logDir: dirBash });
+    printTimeline('Case 30 / Run1 Bash 骨架 (GLM)', bashRun.events, bashRun.duration);
+    const bashSkeleton = analyzeToolUseSkeleton(bashRun.events, 'Bash');
+    const bashTask = analyzeTaskEvents(bashRun.events);
+    console.error('\n── Bash 骨架 ──', JSON.stringify(bashSkeleton, null, 2));
+    console.error('── Bash task 事件 ──', JSON.stringify(bashTask.taskStartedDetails, null, 2));
+
+    // ── Run 2: Agent（GLM）──
+    const agentRun = await collectSubagentEvents({ prompt: AGENT_PROMPT, env: BIGMODEL_ENV, logDir: dirAgent });
+    printTimeline('Case 30 / Run2 Agent 骨架 (GLM)', agentRun.events, agentRun.duration);
+    const agentSkeleton = analyzeToolUseSkeleton(agentRun.events, 'Agent');
+    const agentTask = analyzeTaskEvents(agentRun.events);
+    const agentInput = extractToolInputJson(agentRun.events, 'Agent');
+    console.error('\n── Agent 骨架 ──', JSON.stringify(agentSkeleton, null, 2));
+    console.error('── Agent input (input_json_delta 拼出) ──', JSON.stringify(agentInput, null, 2));
+    console.error('── Agent task 事件 ──', JSON.stringify(agentTask.taskStartedDetails, null, 2));
+
+    // subagent 展开：parent_tool_use_id 非 null 的 assistant
+    const subagentAssistants = agentRun.assistantSnaps.filter(a => a.parent_tool_use_id != null);
+
+    const AGENT_6_FIELDS = ['description', 'prompt', 'subagent_type', 'model', 'run_in_background', 'isolation'];
+    const agentFieldsPresent = agentInput ? AGENT_6_FIELDS.filter(f => f in agentInput) : [];
+
+    console.error('\n══════ case-30 骨架对照结论 ══════');
+    console.error(`[Bash]  content_block_start=${bashSkeleton.hasContentBlockStart} input_json_delta=${bashSkeleton.inputJsonDeltaCount} tool_result=${bashSkeleton.hasToolResult} task_type=${JSON.stringify(bashTask.taskStartedDetails.map(d => d.task_type))}`);
+    console.error(`[Agent] content_block_start=${agentSkeleton.hasContentBlockStart} input_json_delta=${agentSkeleton.inputJsonDeltaCount} tool_result=${agentSkeleton.hasToolResult} task_type=${JSON.stringify(agentTask.taskStartedDetails.map(d => d.task_type))}`);
+    console.error(`[Agent input 6 字段命中] ${JSON.stringify(agentFieldsPresent)}（全集 ${JSON.stringify(AGENT_6_FIELDS)}）`);
+    console.error(`[subagent 展开] parent_tool_use_id!=null 的 assistant 数=${subagentAssistants.length}；subagent_type=${JSON.stringify([...new Set(subagentAssistants.map(a => a.subagent_type))])}`);
+    console.error(`[差异] Bash task_type=local_bash? Agent task_type=local_agent?`);
+
+    writeFileSync(`${dirAgent}/skeleton-comparison.json`, JSON.stringify({
+      bash: { skeleton: bashSkeleton, taskStarted: bashTask.taskStartedDetails },
+      agent: { skeleton: agentSkeleton, input: agentInput, agentFieldsPresent, taskStarted: agentTask.taskStartedDetails, subagentAssistantCount: subagentAssistants.length },
+    }, null, 2));
+    writeFileSync(`${dirBash}/sdk-events.json`, JSON.stringify(bashRun.events, null, 2));
+    writeFileSync(`${dirAgent}/sdk-events.json`, JSON.stringify(agentRun.events, null, 2));
+
+    // ── 断言 ──
+    expect(bashRun.events.length).toBeGreaterThan(0);
+    expect(agentRun.events.length).toBeGreaterThan(0);
+
+    // 结构断言：两者都走 tool_use 骨架（content_block_start + tool_result）
+    // 注意：GLM 若未触发对应工具，记否定发现而非硬失败
+    if (bashSkeleton.hasContentBlockStart) {
+      expect(bashSkeleton.hasToolResult).toBe(true);
+    } else {
+      console.error('[否定发现] Bash 未产生 content_block_start（GLM 未走 Bash 工具）');
+    }
+    if (agentSkeleton.hasContentBlockStart) {
+      // Agent 走与 Bash 相同骨架：有 tool_use、有 input_json_delta、有 tool_result
+      expect(agentSkeleton.inputJsonDeltaCount).toBeGreaterThan(0);
+      expect(agentSkeleton.hasToolResult).toBe(true);
+      // Agent 特有：伴随 task_started(local_agent)
+      const agentTaskTypes = agentTask.taskStartedDetails.map(d => d.task_type);
+      if (agentTaskTypes.includes('local_agent')) {
+        console.error('[发现] ✅ Agent 伴随 task_started(local_agent)，Bash 则为 local_bash/无 —— 差异确认');
+      } else {
+        console.error(`[否定发现] Agent 未观测到 task_type=local_agent（实测 ${JSON.stringify(agentTaskTypes)}）`);
+      }
+    } else {
+      console.error('[否定发现] Agent 未产生 content_block_start —— GLM 本轮未触发真实 subagent，记录');
+    }
+  }, 240000);
+});
+
+// ====== case-31 run_in_background 显式对照 ======
+//
+// 子问题2：subagent 有没有前后台？
+// prompt 分别明确要求"前台 subagent"和"后台 subagent"，比较：
+//   · 前台是否阻塞主 turn（task_started 后是否等 subagent 完成才出 result）
+//   · 后台是否立即 task_started + 异步 task_notification
+//   · Agent input.run_in_background 值（前台 false / 后台 true）
+// 记录两种序列差异。主用 GLM。
+
+describe('subagent 阶段二: run_in_background 显式对照', () => {
+  // 让 subagent 做一个稍慢的任务，便于观察前台阻塞 vs 后台异步
+  const FG_PROMPT = 'Use the Agent tool to launch a subagent IN THE FOREGROUND (set run_in_background to false). The subagent must run the Bash command "sleep 5 && echo fg-subagent-31" and report the output. Wait for the subagent to finish, then tell me its result.';
+  const BG_PROMPT = 'Use the Agent tool to launch a subagent IN THE BACKGROUND (set run_in_background to true). The subagent must run the Bash command "sleep 5 && echo bg-subagent-31" and report the output. Let it run in the background.';
+
+  it('case-31 前台 subagent 阻塞 vs 后台 subagent 异步', async () => {
+    const dirFg = createTimestampDir('tool-foreground-background/case-31-fg-subagent');
+    const dirBg = createTimestampDir('tool-foreground-background/case-31-bg-subagent');
+
+    // ── 前台 subagent ──
+    const fgRun = await collectSubagentEvents({ prompt: FG_PROMPT, env: BIGMODEL_ENV, logDir: dirFg });
+    printTimeline('Case 31 / 前台 subagent (GLM)', fgRun.events, fgRun.duration);
+    const fgInput = extractToolInputJson(fgRun.events, 'Agent');
+    const fgTask = analyzeTaskEvents(fgRun.events);
+    // 前台：从 task_started 到 result 的时序（阻塞判据）
+    const fgTaskStartedIdx = fgRun.events.findIndex(e => e.subtype === 'task_started');
+    const fgResultIdx = fgRun.events.findIndex(e => e.type === 'result');
+    console.error('\n── 前台 Agent input ──', JSON.stringify(fgInput, null, 2));
+    console.error(`── 前台 run_in_background=${fgInput ? fgInput.run_in_background : '(无 input)'}`);
+    console.error(`── 前台 task_started@idx=${fgTaskStartedIdx} result@idx=${fgResultIdx}；task_started/notification=${fgTask.taskStartedCount}/${fgTask.taskNotificationCount}`);
+
+    // ── 后台 subagent ──
+    const bgRun = await collectSubagentEvents({ prompt: BG_PROMPT, env: BIGMODEL_ENV, logDir: dirBg });
+    printTimeline('Case 31 / 后台 subagent (GLM)', bgRun.events, bgRun.duration);
+    const bgInput = extractToolInputJson(bgRun.events, 'Agent');
+    const bgTask = analyzeTaskEvents(bgRun.events);
+    console.error('\n── 后台 Agent input ──', JSON.stringify(bgInput, null, 2));
+    console.error(`── 后台 run_in_background=${bgInput ? bgInput.run_in_background : '(无 input)'}`);
+    console.error(`── 后台 task_started/notification=${bgTask.taskStartedCount}/${bgTask.taskNotificationCount}`);
+
+    console.error('\n══════ case-31 前后台对照结论 ══════');
+    console.error(`[前台] input.run_in_background=${fgInput ? JSON.stringify(fgInput.run_in_background) : 'N/A'}, task_started=${fgTask.taskStartedCount}, task_notification=${fgTask.taskNotificationCount}, 耗时=${fgRun.duration}ms`);
+    console.error(`[后台] input.run_in_background=${bgInput ? JSON.stringify(bgInput.run_in_background) : 'N/A'}, task_started=${bgTask.taskStartedCount}, task_notification=${bgTask.taskNotificationCount}, 耗时=${bgRun.duration}ms`);
+    console.error(`[task_type] 前台=${JSON.stringify(fgTask.taskStartedDetails.map(d => d.task_type))} 后台=${JSON.stringify(bgTask.taskStartedDetails.map(d => d.task_type))}`);
+
+    writeFileSync(`${dirFg}/sdk-events.json`, JSON.stringify(fgRun.events, null, 2));
+    writeFileSync(`${dirBg}/sdk-events.json`, JSON.stringify(bgRun.events, null, 2));
+    writeFileSync(`${dirBg}/fg-bg-comparison.json`, JSON.stringify({
+      foreground: { input: fgInput, taskStarted: fgTask.taskStartedDetails, taskStartedCount: fgTask.taskStartedCount, taskNotificationCount: fgTask.taskNotificationCount, duration: fgRun.duration },
+      background: { input: bgInput, taskStarted: bgTask.taskStartedDetails, taskStartedCount: bgTask.taskStartedCount, taskNotificationCount: bgTask.taskNotificationCount, duration: bgRun.duration },
+    }, null, 2));
+
+    // ── 断言（宽松，先观察）──
+    expect(fgRun.events.length).toBeGreaterThan(0);
+    expect(bgRun.events.length).toBeGreaterThan(0);
+    // 记录 run_in_background 差异（LLM 是否遵循指令）
+    if (fgInput && 'run_in_background' in fgInput) {
+      console.error(`[发现] 前台 subagent input.run_in_background=${fgInput.run_in_background}`);
+    } else {
+      console.error('[否定发现] 前台 subagent 未触发 Agent 或 input 无 run_in_background 字段');
+    }
+    if (bgInput && 'run_in_background' in bgInput) {
+      console.error(`[发现] 后台 subagent input.run_in_background=${bgInput.run_in_background}`);
+    } else {
+      console.error('[否定发现] 后台 subagent 未触发 Agent 或 input 无 run_in_background 字段');
+    }
+  }, 300000);
+});
+
+// ====== case-32 默认行为 ======
+//
+// 子问题2：不指示前后台时，Agent input.run_in_background 的默认值是什么？
+// 复验 case-5 的"v2.1.198 默认后台"结论在 GLM 上是否成立。
+// 不给任何前台/后台指示，读 Agent input 里 run_in_background 字段的有无与取值。
+// 主用 GLM + 本地 BASE_ENV 双跑对照。
+
+describe('subagent 阶段二: 默认 run_in_background', () => {
+  const DEFAULT_PROMPT = 'Use the Agent tool to launch a subagent that counts how many .ts files exist under the test directory using a Bash command, then reports the count. Report the subagent result to me.';
+
+  it('case-32 不指示前后台时 Agent input.run_in_background 默认值', async () => {
+    const dirGlm = createTimestampDir('tool-foreground-background/case-32-default-glm');
+    const dirLocal = createTimestampDir('tool-foreground-background/case-32-default-local');
+
+    // ── GLM ──
+    const glmRun = await collectSubagentEvents({ prompt: DEFAULT_PROMPT, env: BIGMODEL_ENV, logDir: dirGlm });
+    printTimeline('Case 32 / 默认 (GLM)', glmRun.events, glmRun.duration);
+    const glmInput = extractToolInputJson(glmRun.events, 'Agent');
+    const glmTask = analyzeTaskEvents(glmRun.events);
+    const glmHasField = glmInput ? 'run_in_background' in glmInput : false;
+    console.error('\n── GLM Agent input ──', JSON.stringify(glmInput, null, 2));
+    console.error(`── GLM run_in_background 字段存在=${glmHasField} 值=${glmInput ? JSON.stringify(glmInput.run_in_background) : 'N/A'}`);
+    console.error(`── GLM task_type=${JSON.stringify(glmTask.taskStartedDetails.map(d => d.task_type))}`);
+
+    // ── 本地 BASE_ENV 对照 ──
+    let localInput: any = null;
+    let localHasField = false;
+    let localTask: any = null;
+    try {
+      const localRun = await collectSubagentEvents({ prompt: DEFAULT_PROMPT, env: BASE_ENV, logDir: dirLocal });
+      printTimeline('Case 32 / 默认 (本地 Jereh-LLM)', localRun.events, localRun.duration);
+      localInput = extractToolInputJson(localRun.events, 'Agent');
+      localTask = analyzeTaskEvents(localRun.events);
+      localHasField = localInput ? 'run_in_background' in localInput : false;
+      console.error('\n── 本地 Agent input ──', JSON.stringify(localInput, null, 2));
+      console.error(`── 本地 run_in_background 字段存在=${localHasField} 值=${localInput ? JSON.stringify(localInput.run_in_background) : 'N/A'}`);
+      writeFileSync(`${dirLocal}/sdk-events.json`, JSON.stringify(localRun.events, null, 2));
+    } catch (e: any) {
+      console.error(`[本地对照] 跑失败/触发不到: ${e?.message || e} —— 记否定发现`);
+    }
+
+    console.error('\n══════ case-32 默认行为结论 ══════');
+    console.error(`[GLM]  run_in_background 字段=${glmHasField ? `存在(=${JSON.stringify(glmInput.run_in_background)})` : '缺省'}；task_type=${JSON.stringify(glmTask.taskStartedDetails.map(d => d.task_type))}`);
+    console.error(`[本地] run_in_background 字段=${localInput ? (localHasField ? `存在(=${JSON.stringify(localInput.run_in_background)})` : '缺省') : '(未触发 Agent)'}`);
+    console.error(`[对照 case-5] case-5 结论：默认后台（input 无 run_in_background 字段 或 =true）`);
+
+    writeFileSync(`${dirGlm}/sdk-events.json`, JSON.stringify(glmRun.events, null, 2));
+    writeFileSync(`${dirGlm}/default-behavior.json`, JSON.stringify({
+      glm: { input: glmInput, hasField: glmHasField, value: glmInput?.run_in_background, taskStarted: glmTask.taskStartedDetails },
+      local: { input: localInput, hasField: localHasField, value: localInput?.run_in_background, taskStarted: localTask?.taskStartedDetails ?? null },
+    }, null, 2));
+
+    // ── 断言 ──
+    expect(glmRun.events.length).toBeGreaterThan(0);
+    if (!glmInput) {
+      console.error('[否定发现] GLM 默认场景未触发 Agent 工具 —— 记录');
+    }
+  }, 300000);
+});
+
+// ====== case-33 backgroundTasks/stopTask 对 local_agent 是否生效 ======
+//
+// 子问题2 关键补白：现有终止/转后台（case-15/17/26）只测过 Bash（local_bash）！
+// 本 case 专门验证控制方法对 subagent（local_agent）是否生效。
+// streaming-input 模式，让 subagent 跑够久的任务，等 task_started(task_type=local_agent) 后：
+//   路径A：stopTask(taskId) —— 观察是否出现 killed(task_updated) + stopped(task_notification)，
+//          对照 case-15/26（Bash 的 stopTask）
+//   路径B：（另起一跑）backgroundTasks(toolUseId) —— 观察返回值、是否转后台
+// 遵循 case-17 铁律：控制方法必须在 task_started 之后调用。
+// 主用 GLM（稳定触发真实 subagent + 够久任务）。
+
+describe('subagent 阶段二: 控制方法对 local_agent 是否生效', () => {
+  // 让 subagent 跑一个够久的任务（sleep 30），给控制方法留时间窗
+  const LONG_SUBAGENT_PROMPT = 'Use the Agent tool to launch a subagent. Instruct the subagent to run the Bash command "sleep 30 && echo subagent-long-33" and report its output. Let the subagent work on this.';
+
+  /** 共享的 streaming-input + task_started 后调控制方法的执行器 */
+  async function runControlOnSubagent(options: {
+    logDir: string;
+    control: 'stopTask' | 'backgroundTasks';
+  }) {
+    const state = {
+      queryStartedAt: Date.now(),
+      agentTaskId: null as string | null,          // task_started.task_id（local_agent）
+      agentTaskType: null as string | null,
+      taskStartedToolUseId: null as string | null, // task_started.tool_use_id
+      agentBlockId: null as string | null,          // 顶层 Agent tool_use block.id
+      taskStartedAt: null as number | null,
+      controlResult: 'NOT_CALLED' as boolean | 'NOT_CALLED' | 'OK' | 'NO_METHOD' | string,
+      controlCallAt: null as number | null,
+      controlUsedId: null as string | null,
+      taskUpdatedStatuses: [] as { relMs: number; status: string | undefined; patchKeys: string[] }[],
+      sawKilled: false,
+      taskNotificationStatus: null as string | null,
+      taskNotificationAt: null as number | null,
+      backgroundTaskIdFromResult: null as string | null,
+      queryEnded: false,
+      queryEndedAt: null as number | null,
+      resultSubtype: null as string | null,
+      turnsObserved: 0,
+      turn2Reached: false,
+    };
+
+    const events: CapturedSDKEvent[] = [];
+
+    let resolveTurn2: () => void = () => {};
+    const turn2Gate = new Promise<void>((r) => { resolveTurn2 = r; });
+    const turn2Timeout = new Promise<void>((r) => setTimeout(r, 25000));
+
+    const msg1: any = {
+      type: 'user',
+      message: { role: 'user', content: LONG_SUBAGENT_PROMPT },
+      parent_tool_use_id: null,
+    };
+    const msg2: any = {
+      type: 'user',
+      message: { role: 'user', content: 'What is the final status of the subagent task? Just report it in one sentence. Do NOT launch any new subagents or run commands.' },
+      parent_tool_use_id: null,
+      priority: 'now',
+    };
+    async function* promptInput(): AsyncIterable<any> {
+      yield msg1;
+      await Promise.race([turn2Gate, turn2Timeout]);
+      state.turn2Reached = true;
+      console.error(`\n[gen] turn2 放行 @ ${Date.now() - state.queryStartedAt}ms`);
+      yield msg2;
+    }
+
+    const env = { ...BIGMODEL_ENV, OTEL_LOG_RAW_API_BODIES: `file:${options.logDir}` };
+    const sdkQuery = query({
+      prompt: promptInput(),
+      options: { env, includePartialMessages: true, persistSession: false, settingSources: [], effort: 'low', permissionMode: 'bypassPermissions' } as any,
+    });
+    const queryHandle: any = sdkQuery;
+
+    const observer = setInterval(() => {
+      const t = Date.now() - state.queryStartedAt;
+      console.error(`[obs t=${t}ms] agentTaskId=${state.agentTaskId ?? '-'}(${state.agentTaskType ?? '-'}) ${options.control}=${state.controlResult} killed=${state.sawKilled} notif=${state.taskNotificationStatus ?? '-'} ended=${state.queryEnded}`);
+    }, 1000);
+
+    let index = 0;
+    try {
+      for await (const message of sdkQuery) {
+        const msg = message as any;
+        const type = msg.type || 'unknown';
+        const rel = Date.now() - state.queryStartedAt;
+        const captured: CapturedSDKEvent = { index: index++, type, timestamp: Date.now() };
+
+        if (type === 'stream_event' && msg.event) {
+          captured.eventType = msg.event.type;
+          if (msg.event.type === 'content_block_delta' && msg.event.delta?.type === 'text_delta') {
+            process.stderr.write(msg.event.delta.text);
+          }
+        }
+
+        if (type === 'system') {
+          captured.subtype = msg.subtype;
+          if (msg.subtype === 'task_started') {
+            captured.taskId = msg.task_id;
+            captured.taskType = msg.task_type;
+            captured.raw = { ...msg };
+            // 只锁定 local_agent 的 task_started（subagent），忽略 subagent 内部可能的 local_bash
+            if (!state.agentTaskId && msg.task_type === 'local_agent') {
+              state.agentTaskId = msg.task_id;
+              state.agentTaskType = msg.task_type;
+              state.taskStartedToolUseId = msg.tool_use_id ?? null;
+              state.taskStartedAt = rel;
+              console.error(`\n[${rel}ms] task_started(local_agent) task_id=${msg.task_id} tool_use_id=${msg.tool_use_id} subagent_type=${msg.subagent_type ?? '-'}`);
+            } else if (!state.agentTaskId) {
+              // 记录非 local_agent 的 task_started（诊断用）
+              console.error(`\n[${rel}ms] task_started(非 local_agent) task_id=${msg.task_id} task_type=${msg.task_type}`);
+            }
+          }
+          if (msg.subtype === 'task_updated') {
+            const p = msg.patch || {};
+            state.taskUpdatedStatuses.push({ relMs: rel, status: p.status, patchKeys: Object.keys(p) });
+            if (p.status === 'killed') state.sawKilled = true;
+            captured.taskId = msg.task_id;
+            captured.raw = { patch: p };
+            console.error(`\n[${rel}ms] ⚡ task_updated task_id=${msg.task_id} patch=${JSON.stringify(p)}`);
+          }
+          if (msg.subtype === 'task_notification') {
+            captured.taskId = msg.task_id;
+            captured.taskStatus = msg.status;
+            captured.taskType = msg.task_type;
+            captured.raw = { status: msg.status, output_file: msg.output_file, task_type: msg.task_type };
+            // 只记 local_agent 那条（或首条）
+            if (msg.task_id === state.agentTaskId || state.taskNotificationStatus == null) {
+              state.taskNotificationStatus = msg.status;
+              state.taskNotificationAt = rel;
+            }
+            console.error(`\n[${rel}ms] task_notification task_id=${msg.task_id} status=${msg.status} task_type=${msg.task_type ?? '-'}`);
+            resolveTurn2();
+          }
+        }
+
+        if (type === 'assistant' && msg.message?.content) {
+          state.turnsObserved++;
+          for (const block of msg.message.content) {
+            if (block.type === 'tool_use') {
+              captured.toolName = block.name;
+              captured.toolUseId = block.id;
+              // 顶层 Agent block.id（parent_tool_use_id==null）
+              if (block.name === 'Agent' && msg.parent_tool_use_id == null && !state.agentBlockId) {
+                state.agentBlockId = block.id;
+                console.error(`\n[${rel}ms] 顶层 Agent block.id=${block.id}`);
+              }
+              if (!captured.raw) captured.raw = {};
+              captured.raw.toolInput = block.input;
+            }
+          }
+        }
+
+        if (type === 'user') {
+          const cb = Array.isArray(msg.message?.content) ? msg.message.content : [];
+          for (const b of cb) {
+            if (b.type === 'tool_result') {
+              const snippet = typeof b.content === 'string' ? b.content
+                : Array.isArray(b.content) ? b.content.map((c: any) => (c.type === 'text' ? c.text : '')).join('') : '';
+              captured.raw = { tool_use_id: b.tool_use_id, contentSnippet: snippet.substring(0, 500) };
+              const m = snippet.match(/backgroundTaskId["']?\s*[:=]\s*["']?([A-Za-z0-9_-]+)/i) || snippet.match(/ID:\s*([A-Za-z0-9_-]+)/i);
+              if (m && !state.backgroundTaskIdFromResult) state.backgroundTaskIdFromResult = m[1];
+            }
+          }
+        }
+
+        if (type === 'result') {
+          captured.raw = { subtype: msg.subtype, num_turns: msg.num_turns, terminal_reason: msg.terminal_reason };
+          state.queryEnded = true;
+          state.queryEndedAt = rel;
+          state.resultSubtype = msg.subtype;
+          console.error(`\n[${rel}ms] result subtype=${msg.subtype} num_turns=${msg.num_turns}`);
+          resolveTurn2();
+        }
+
+        events.push(captured);
+
+        // ── 控制调用：等 local_agent 的 task_started 后调用 ──
+        if (state.agentTaskId && state.controlResult === 'NOT_CALLED') {
+          state.controlCallAt = rel;
+          if (options.control === 'stopTask') {
+            console.error(`\n[stopTask] 等到 task_started(local_agent) 后调用 @ ${rel}ms，taskId=${state.agentTaskId}`);
+            state.controlUsedId = state.agentTaskId;
+            try {
+              if (typeof queryHandle.stopTask === 'function') {
+                await queryHandle.stopTask(state.agentTaskId);
+                state.controlResult = 'OK';
+              } else {
+                state.controlResult = 'NO_METHOD';
+              }
+            } catch (e: any) {
+              state.controlResult = `ERROR: ${e?.message || e}`;
+            }
+            console.error(`[stopTask] 结果: ${state.controlResult}`);
+          } else {
+            // backgroundTasks：用 task_started.tool_use_id（回退 Agent block.id）
+            const idToUse = state.taskStartedToolUseId || state.agentBlockId || undefined;
+            state.controlUsedId = idToUse ?? null;
+            console.error(`\n[backgroundTasks] 等到 task_started(local_agent) 后调用 @ ${rel}ms，用 id=${idToUse}`);
+            try {
+              state.controlResult = typeof queryHandle.backgroundTasks === 'function'
+                ? await queryHandle.backgroundTasks(idToUse)
+                : 'NO_METHOD';
+            } catch (e: any) {
+              state.controlResult = `ERROR: ${e?.message || e}`;
+            }
+            console.error(`[backgroundTasks] 返回: ${state.controlResult}`);
+            if (state.controlResult === true) resolveTurn2();
+          }
+        }
+      }
+    } finally {
+      clearInterval(observer);
+    }
+
+    const duration = Date.now() - state.queryStartedAt;
+    if (!state.queryEnded) state.queryEndedAt = duration;
+    return { state, events, duration };
+  }
+
+  it('case-33A stopTask 对 local_agent subagent', async () => {
+    const dir = createTimestampDir('tool-foreground-background/case-33a-stoptask-subagent');
+    const { state, events, duration } = await runControlOnSubagent({ logDir: dir, control: 'stopTask' });
+
+    printTimeline('Case 33A: stopTask 对 local_agent', events, duration);
+    // sleep 30 若被杀，总耗时应远小于自然完成
+    const killedInterrupted = state.taskStartedAt != null && duration - state.taskStartedAt < 30000;
+
+    console.error('\n══════ case-33A 实测值（stopTask 对 subagent）══════');
+    console.error(`[A1] 是否观测到 task_started(local_agent): ${state.agentTaskId != null}（task_id=${state.agentTaskId}, type=${state.agentTaskType}, @${state.taskStartedAt}ms）`);
+    console.error(`[A2] stopTask 结果: ${state.controlResult}（@${state.controlCallAt}ms，用 taskId=${state.controlUsedId}）`);
+    console.error(`[A3] task_updated 序列: ${JSON.stringify(state.taskUpdatedStatuses)}；是否报 killed=${state.sawKilled}（对照 case-15/26 Bash）`);
+    console.error(`[A4] task_notification status=${state.taskNotificationStatus}@${state.taskNotificationAt}ms（期望 stopped）`);
+    console.error(`[A5] sleep 30 是否被中断: task_started 后 ${state.taskStartedAt != null ? duration - state.taskStartedAt : '?'}ms 结束（<30000=被杀=${killedInterrupted}）；总耗时=${duration}ms`);
+    console.error(`[补充] turn2Reached=${state.turn2Reached} turnsObserved=${state.turnsObserved} result.subtype=${state.resultSubtype}`);
+
+    writeFileSync(`${dir}/sdk-events.json`, JSON.stringify(events, null, 2));
+    writeFileSync(`${dir}/stoptask-subagent.json`, JSON.stringify({
+      agentTaskId: state.agentTaskId, agentTaskType: state.agentTaskType, taskStartedAt: state.taskStartedAt,
+      controlResult: state.controlResult, controlCallAt: state.controlCallAt, controlUsedId: state.controlUsedId,
+      taskUpdatedStatuses: state.taskUpdatedStatuses, sawKilled: state.sawKilled,
+      taskNotificationStatus: state.taskNotificationStatus, taskNotificationAt: state.taskNotificationAt,
+      killedInterrupted, turn2Reached: state.turn2Reached, turnsObserved: state.turnsObserved,
+      resultSubtype: state.resultSubtype, queryEndedAt: state.queryEndedAt, duration,
+    }, null, 2));
+
+    // ── 断言 ──
+    expect(events.length).toBeGreaterThan(0);
+    if (state.agentTaskId == null) {
+      console.error('[否定发现] 未观测到 task_started(local_agent) —— GLM 本轮未触发后台 subagent，stopTask 未能施加于 local_agent');
+    } else {
+      // 触发到了才断言方法被调用
+      expect(state.controlResult).not.toBe('NOT_CALLED');
+      expect(state.controlResult).not.toBe('NO_METHOD');
+      // 软断言：记录 stopped/killed 是否出现
+      if (state.taskNotificationStatus === 'stopped') {
+        console.error('[发现] ✅ stopTask 对 local_agent 生效：task_notification status=stopped');
+      } else {
+        console.error(`[否定发现] stopTask 后 task_notification status=${state.taskNotificationStatus}（非 stopped）—— 记录实测`);
+      }
+    }
+  }, 240000);
+
+  it('case-33B backgroundTasks 对 local_agent subagent', async () => {
+    const dir = createTimestampDir('tool-foreground-background/case-33b-bgtasks-subagent');
+    const { state, events, duration } = await runControlOnSubagent({ logDir: dir, control: 'backgroundTasks' });
+
+    printTimeline('Case 33B: backgroundTasks 对 local_agent', events, duration);
+
+    console.error('\n══════ case-33B 实测值（backgroundTasks 对 subagent）══════');
+    console.error(`[B1] 是否观测到 task_started(local_agent): ${state.agentTaskId != null}（task_id=${state.agentTaskId}, @${state.taskStartedAt}ms）`);
+    console.error(`[B2] backgroundTasks 返回: ${state.controlResult}（@${state.controlCallAt}ms，用 id=${state.controlUsedId}）`);
+    console.error(`[B3] task_started.tool_use_id=${state.taskStartedToolUseId} vs 顶层 Agent block.id=${state.agentBlockId}（是否一致=${state.taskStartedToolUseId === state.agentBlockId}）`);
+    console.error(`[B4] tool_result.backgroundTaskId=${state.backgroundTaskIdFromResult}；task_notification status=${state.taskNotificationStatus}`);
+    console.error(`[B5] 若返回 true：query 是否解阻塞、可续轮 turn2Reached=${state.turn2Reached}；总耗时=${duration}ms`);
+    console.error(`[补充] turnsObserved=${state.turnsObserved} result.subtype=${state.resultSubtype}`);
+
+    writeFileSync(`${dir}/sdk-events.json`, JSON.stringify(events, null, 2));
+    writeFileSync(`${dir}/bgtasks-subagent.json`, JSON.stringify({
+      agentTaskId: state.agentTaskId, agentTaskType: state.agentTaskType, taskStartedAt: state.taskStartedAt,
+      controlResult: state.controlResult, controlCallAt: state.controlCallAt, controlUsedId: state.controlUsedId,
+      taskStartedToolUseId: state.taskStartedToolUseId, agentBlockId: state.agentBlockId,
+      backgroundTaskIdFromResult: state.backgroundTaskIdFromResult,
+      taskNotificationStatus: state.taskNotificationStatus, taskUpdatedStatuses: state.taskUpdatedStatuses,
+      turn2Reached: state.turn2Reached, turnsObserved: state.turnsObserved,
+      resultSubtype: state.resultSubtype, queryEndedAt: state.queryEndedAt, duration,
+    }, null, 2));
+
+    // ── 断言 ──
+    expect(events.length).toBeGreaterThan(0);
+    if (state.agentTaskId == null) {
+      console.error('[否定发现] 未观测到 task_started(local_agent) —— GLM 本轮未触发后台 subagent，backgroundTasks 未能施加于 local_agent');
+    } else {
+      expect(state.controlResult).not.toBe('NOT_CALLED');
+      expect(state.controlResult).not.toBe('NO_METHOD');
+      if (state.controlResult === true) {
+        console.error('[发现] ✅ backgroundTasks 对 local_agent 返回 true —— subagent 可转后台');
+      } else {
+        console.error(`[否定发现] backgroundTasks 对 local_agent 返回 ${state.controlResult}（非 true）—— 记录实测`);
+      }
+    }
+  }, 240000);
+});
