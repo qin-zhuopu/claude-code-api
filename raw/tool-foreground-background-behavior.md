@@ -44,6 +44,9 @@
 | 75 | **后台 bash 跑在 git-bash(MSYS2) 里**，`$$`/`ps`/`kill`/`wmic` 全可用；SDK 不暴露 PID，须让命令 `echo $$` 自暴露 | Case 29 |
 | 76 | **`close()` 后后台 bash 进程【变孤儿、不被回收】** —— PID 硬观测：close 后持续 19s 每次 `ps -p` 探活均存活。**0.3.220 复验结论不变**（PID 28694，stillAliveAfterClose=true） | Case 27b |
 | 77 | **关闭会话必须先 `stopTask` 再 `close`** —— 否则后台进程成孤儿继续跑到自然结束（case-26 证明 stopTask 能真正杀进程） | Case 27b |
+| 78 | **短前台命令（echo，秒完成）【无 .output 文件】** —— 未触发自动后台化，不落盘，输出只能等 tool_result 一次性拿 | Case 40a：23 次扫 tasks 目录，从无 .output |
+| 79 | **长前台命令被自动后台化后，.output 文件在 task_started 后 ~12ms 就出现且可实时 tail** | Case 40b：firstFileExistAt−taskStartedAt=12ms，maxLines=6 实时增长 |
+| 80 | **.output 文件在 query 存活期【一直不删】** —— 印证官方文档「后台任务在 Claude Code 退出时才清理」（interactive-mode.md:286） | Case 41：命令完成、query 结束后再探 8s，文件均未消失（fileVanishedAt=null）|
 | 74 | **`paused` 状态仍无法在 SDK query 层触发** —— backgroundTasks+interrupt+stopTask 组合只跑出 killed，未见 paused（补强 case-21 发现 58） | Case 28 |
 
 ---
@@ -749,13 +752,48 @@ case-18a（`seq 1 8`，16s）测出「前台 SDK 事件流无增量 stdout」，
 
 > ⚠️ **未完全坐实**：本项目只测 SDK `query()` 层，未直接测 TUI，无法 100% 断言「Ctrl+O 读的就是这个文件」。此结论是「文件实时增长（已证）+ Ctrl+O 是 transcript viewer（文档已证）」的强推断，非直接证据。要钉死需查 TUI 源码或在真实 TUI 中对照文件内容。
 
-### 输出可见性的完整图景（case-18 + case-19 + case-17b）
+## 前台命令是否有 .output 文件 + 文件存活时长（case-40 / case-41）
+
+> 调研人：Claude Code，日期：2026-07-25（SDK 0.3.220）
+> 目的：回答两个产品问题 —— (1) 前台任务有没有 .output 文件？(2) 后台任务文件保存多久？
+> 方法：case-40 拼 session_id+task_id 路径 existsSync 检查；case-41 量化文件从出现到被删的存活时长。
+
+### case-40：前台命令是否有 .output 文件（分短/长两子场景）
+
+| 子场景 | 命令 | 是否触发自动后台化 | 是否有 .output | 证据 |
+|--------|------|-------------------|---------------|------|
+| **40a 短前台** | `echo` ×2（秒完成） | ❌ 否（无 task_started） | ❌ **无** | 23 次扫 tasks 目录，outputCount 恒 0 |
+| **40b 中等前台** | `seq 1 6` + sleep（~12s） | ✅ 是（task_started@12722ms） | ✅ **有** | 文件在 task_started 后 12ms 出现，maxLines=6 实时增长 |
+
+**结论**：前台命令**是否有 .output 文件取决于是否被自动后台化**（~5s 阈值，见 case-19）。纯短命令不落盘，输出只能等 tool_result 一次性拿；长命令被自动后台化后 ~12ms 内就有 .output，可实时 tail。
+
+### case-41：.output 文件存活时长（实测印证官方文档）
+
+显式后台命令产生 .output 后，持续探测文件是否被删，跨越「命令完成→query 结束→query 结束后 8s」三阶段：
+
+| 关键时刻 | 相对 t0 |
+|---------|---------|
+| .output 首现 | 11124ms |
+| 命令完成（task_notification） | 16120ms |
+| query 结束（result） | 21937ms |
+| **文件消失** | **未观测到（fileVanishedAt=null）** |
+
+**结论**：`.output` 文件在 **query 存活期一直不删**——命令完成后没删、query 结束后又探 8s（到 30094ms）仍在。这**印证官方文档**（`interactive-mode.md:286`）：「后台任务在 **Claude Code 退出时**才自动清理」。清理由**进程/session 生命周期**决定，不是命令完成或固定 TTL。
+
+> **回答产品两问**：
+> 1. **前台任务有 .output 文件吗？** — 短命令无、长命令（被自动后台化）有。
+> 2. **后台任务文件保存多久？** — 当前 Claude Code 进程/服务存活期间一直保留，进程退出时清理；转后台的 session 里任务继续存活；输出超 5GB 任务被终止（文档 interactive-mode.md:287）；transcript 类默认 30 天（cleanupPeriodDays）。case-15 曾见「停止后很快清理读不到」，实为其 query/进程结束触发清理，非文件短 TTL。
+
+---
+
+### 输出可见性的完整图景（case-18 + case-19 + case-17b + case-40/41）
 
 | 视角 | 短前台命令 | 长前台命令（被自动后台化） | 显式后台命令 | 手动转后台（backgroundTasks） |
 |------|-----------|--------------------------|-------------|------------------------------|
 | SDK 事件流（query 调用方） | tool_result 一次性 | tool_result 一次性（事件流不逐字流 stdout） | tool_result 立即返回 backgroundTaskId | tool_result 立即返回 backgroundTaskId |
-| `.output` 文件 | 可能不产生 | **实时增长，可 tail**（case-19） | **实时增长，可 tail**（case-18b） | **实时增长，可 tail**（case-17b） |
+| `.output` 文件 | **不产生**（case-40a 实测） | **实时增长，可 tail**（case-19，task_started 后 ~12ms 出现 case-40b） | **实时增长，可 tail**（case-18b） | **实时增长，可 tail**（case-17b） |
 | `output_file` 路径来源 | — | **notif 为 null，需 session_id+task_id 拼**（case-19） | tool_result 提示文本给 | **notif + tool_result 都给**（case-17b，无需拼） |
+| 文件存活时长 | — | **进程存活期一直在**（case-41） | 同左 | 同左 |
 | TUI Ctrl+O | 结束后展开看 | **实时可见（读 .output 文件，推断）** | 实时可见 | 实时可见 |
 
 > **三种后台路径输出可读性已全部实测**：显式后台（case-18b）、自动后台化（case-19）、手动转后台（case-17b）三条路径的 `.output` 文件**都能在任务运行期间实时 tail 到增量**。关键差异只在 `output_file` 路径的获取方式：**只有自动后台化的 `task_notification.output_file` 为 null（须自己用 session_id+task_id 拼），显式后台和手动转后台都直接在 tool_result / notification 里给出路径**。

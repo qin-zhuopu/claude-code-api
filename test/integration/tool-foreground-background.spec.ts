@@ -6591,3 +6591,288 @@ describe('subagent 阶段四: 三通道横向对照', () => {
     }
   }, 240000);
 });
+
+// ====== 前台命令是否有 .output 文件（case-40）======
+//
+// 缘起：case-19 只测了「长前台命令【被自动后台化后】拼路径能读到 .output」。
+// 但一个更基础的问题没测过：前台运行 bash 命令时，用 session_id+task_id 拼出
+// .output 路径去 existsSync，到底有没有这个文件？分两个子场景：
+//   40a 短前台命令（echo，秒完成，不会触发自动后台化）：无 task_started → 无 task_id，
+//       只能【扫 tasks 目录】看有没有任何 .output 冒出来。验证：短前台命令根本不落盘？
+//   40b 中等前台命令（seq 循环，会被自动后台化）：观测 task_id 出现时机 vs
+//       .output 文件出现时机——文件是在 task_started【之前】就有，还是之后才建？
+// 这直接回答产品问题：能不能靠「拼路径 + existsSync 轮询」在前台命令跑起来的
+// 第一时间就 tail 到输出，而不依赖 run_in_background。
+import { readdirSync } from 'fs';
+
+describe('前台命令是否有 .output 文件', () => {
+  const SHORT_FG = 'echo fg40-short-line-1 && echo fg40-short-line-2';
+  const MID_FG = 'for i in $(seq 1 6); do echo tick-$i; sleep 2; done';
+
+  // 拼 tasks 目录路径（session 级）
+  const tasksDirOf = (sessionId: string): string => {
+    const cwd = process.cwd();
+    const sanitized = cwd.replace(/[:\\/.]/g, '-');
+    const tmp = process.env.TEMP || process.env.TMP || 'C:\\Users\\14409~1.JER\\AppData\\Local\\Temp';
+    return `${tmp}\\claude\\${sanitized}\\${sessionId}\\tasks`;
+  };
+
+  it('case-40a 短前台命令：扫 tasks 目录看是否落盘 .output', async () => {
+    const dir = createTimestampDir('tool-foreground-background/case-40a-short-fg-output');
+    const t0 = Date.now();
+    let sessionId: string | null = null;
+    let sawTaskStarted = false;
+    const dirSnapshots: any[] = [];
+
+    const env = { ...BASE_ENV, OTEL_LOG_RAW_API_BODIES: `file:${dir}` };
+    const sdkQuery = query({
+      prompt: `Use the Bash tool to run this exact command in the FOREGROUND (do NOT set run_in_background): ${SHORT_FG}`,
+      options: { env, includePartialMessages: true, persistSession: false, settingSources: [], effort: 'low', permissionMode: 'bypassPermissions' } as any,
+    });
+
+    // 每 500ms 扫 tasks 目录，看有没有 .output 文件冒出
+    const poller = setInterval(() => {
+      const t = Date.now() - t0;
+      if (sessionId) {
+        const td = tasksDirOf(sessionId);
+        let files: string[] = [];
+        let dirExists = false;
+        try { files = readdirSync(td); dirExists = true; } catch { /* 目录不存在 */ }
+        const outputs = files.filter(f => f.endsWith('.output'));
+        dirSnapshots.push({ t, dirExists, outputCount: outputs.length, files: outputs });
+        console.error(`[scan t=${t}ms] tasks目录存在=${dirExists} .output数=${outputs.length}${outputs.length ? ' → ' + outputs.join(',') : ''}`);
+      }
+    }, 500);
+
+    const events: CapturedSDKEvent[] = [];
+    let index = 0;
+    try {
+      for await (const message of sdkQuery) {
+        const msg = message as any;
+        const type = msg.type || 'unknown';
+        const rel = Date.now() - t0;
+        if (!sessionId && msg.session_id) { sessionId = msg.session_id; console.error(`\n[${rel}ms] sessionId=${sessionId}`); }
+        if (type === 'system' && msg.subtype === 'task_started') {
+          sawTaskStarted = true;
+          console.error(`\n[${rel}ms] ⚠️ 短命令竟触发 task_started（意外）task_id=${msg.task_id}`);
+        }
+        events.push({ index: index++, type, timestamp: Date.now(), subtype: msg.subtype });
+      }
+    } finally {
+      clearInterval(poller);
+    }
+
+    const duration = Date.now() - t0;
+    const everSawOutput = dirSnapshots.some(s => s.outputCount > 0);
+
+    console.error('\n══════ case-40a 实测值 ══════');
+    console.error(`[40a-1] 短前台命令是否触发 task_started（自动后台化）: ${sawTaskStarted}`);
+    console.error(`[40a-2] tasks 目录里是否出现过 .output 文件: ${everSawOutput}`);
+    console.error(`[40a-3] 扫描快照数: ${dirSnapshots.length}, 总耗时: ${duration}ms`);
+    console.error(`【结论】短前台命令${everSawOutput ? '【有】' : '【无】'} .output 落盘文件`);
+
+    writeFileSync(`${dir}/short-fg-output.json`, JSON.stringify({
+      sessionId, sawTaskStarted, everSawOutput, duration, dirSnapshots,
+    }, null, 2));
+
+    expect(events.length).toBeGreaterThan(0);
+  }, 120000);
+
+  it('case-40b 中等前台命令：task_id 出现时机 vs .output 文件出现时机', async () => {
+    const dir = createTimestampDir('tool-foreground-background/case-40b-mid-fg-output');
+    const t0 = Date.now();
+    let sessionId: string | null = null;
+    let bashTaskId: string | null = null;
+    let taskStartedAt: number | null = null;
+    let candidatePath: string | null = null;
+    let firstFileExistAt: number | null = null;
+    const snapshots: any[] = [];
+
+    const env = { ...BASE_ENV, OTEL_LOG_RAW_API_BODIES: `file:${dir}` };
+    const sdkQuery = query({
+      prompt: `Use the Bash tool to run this exact command in the FOREGROUND (do NOT set run_in_background): ${MID_FG}. Then report how many lines printed.`,
+      options: { env, includePartialMessages: true, persistSession: false, settingSources: [], effort: 'low', permissionMode: 'bypassPermissions' } as any,
+    });
+
+    // 每 500ms：若已拼出候选路径就 existsSync + 读行数
+    const poller = setInterval(() => {
+      const t = Date.now() - t0;
+      // 即便还没 task_started，只要有 sessionId 就先扫目录，捕捉文件比 task_started 早出现的情况
+      if (sessionId && !candidatePath) {
+        const td = tasksDirOf(sessionId);
+        try {
+          const outs = readdirSync(td).filter(f => f.endsWith('.output'));
+          if (outs.length) console.error(`[scan t=${t}ms] task_started前 tasks目录已有 .output: ${outs.join(',')}`);
+        } catch {}
+      }
+      if (candidatePath) {
+        const exists = existsSync(candidatePath);
+        let lineCount = 0;
+        if (exists) {
+          try { lineCount = (readFileSync(candidatePath, 'utf-8').match(/tick-\d+/g) || []).length; } catch {}
+          if (firstFileExistAt === null) { firstFileExistAt = t; console.error(`\n[${t}ms] ✅ .output 文件首次出现（相对 task_started@${taskStartedAt}ms）`); }
+        }
+        snapshots.push({ t, exists, lineCount });
+        console.error(`[poll t=${t}ms] exists=${exists} lines=${lineCount}`);
+      }
+    }, 500);
+
+    const events: CapturedSDKEvent[] = [];
+    let index = 0;
+    try {
+      for await (const message of sdkQuery) {
+        const msg = message as any;
+        const type = msg.type || 'unknown';
+        const rel = Date.now() - t0;
+        if (!sessionId && msg.session_id) sessionId = msg.session_id;
+        if (type === 'system' && msg.subtype === 'task_started' && !bashTaskId) {
+          bashTaskId = msg.task_id;
+          taskStartedAt = rel;
+          if (msg.session_id) sessionId = msg.session_id;
+          if (sessionId) candidatePath = `${tasksDirOf(sessionId)}\\${bashTaskId}.output`;
+          console.error(`\n[${rel}ms] task_started task_id=${msg.task_id} → 候选路径已拼`);
+        }
+        events.push({ index: index++, type, timestamp: Date.now(), subtype: msg.subtype });
+      }
+    } finally {
+      clearInterval(poller);
+    }
+
+    const duration = Date.now() - t0;
+    const maxLines = Math.max(0, ...snapshots.map(s => s.lineCount));
+    const grew = snapshots.filter(s => s.exists).length > 1 && maxLines > 1;
+    const delayFileVsTaskStarted = (firstFileExistAt !== null && taskStartedAt !== null) ? firstFileExistAt - taskStartedAt : null;
+
+    console.error('\n══════ case-40b 实测值 ══════');
+    console.error(`[40b-1] 前台中等命令被自动后台化: ${bashTaskId !== null}（task_started@${taskStartedAt}ms）`);
+    console.error(`[40b-2] .output 文件首次存在@${firstFileExistAt}ms（相对 task_started 延迟 ${delayFileVsTaskStarted}ms）`);
+    console.error(`[40b-3] 文件实时增长: ${grew}（maxLines=${maxLines}）`);
+    console.error(`【结论】前台命令的 .output ${bashTaskId ? '在被自动后台化后才出现' : '未出现（命令太短未后台化）'}；拼路径 existsSync 轮询${grew ? '可' : '不可'}拿到实时增量`);
+
+    writeFileSync(`${dir}/mid-fg-output.json`, JSON.stringify({
+      sessionId, bashTaskId, taskStartedAt, candidatePath, firstFileExistAt,
+      delayFileVsTaskStarted, grew, maxLines, duration, snapshots,
+    }, null, 2));
+
+    expect(events.length).toBeGreaterThan(0);
+  }, 120000);
+});
+
+// ====== .output 文件存活时长（case-41）======
+//
+// 缘起：case-15 提过「任务停止后 .output 文件很快被清理，事后读不到」，但从未量化
+// 「文件从出现到被删存活多久、什么触发删除」。这对产品很关键——若文件命令跑完就秒删，
+// UI 必须在窗口内抢读；若 query 存活期一直在，则从容。
+// 设计：显式后台命令（run_in_background:true）产生 .output，命令跑完（notification）后
+// 【继续留在 for-await 循环里】每秒探文件是否还在，直到 query 自然结束；query 结束后
+// 再探几秒。记录三个关键时刻：文件首现、命令完成(notification)、文件消失、query 结束。
+describe('.output 文件存活时长', () => {
+  const BG_CMD_41 = 'for i in $(seq 1 5); do echo tick-$i; sleep 1; done';
+
+  it('case-41 .output 文件从出现到被删存活多久', async () => {
+    const dir = createTimestampDir('tool-foreground-background/case-41-output-lifetime');
+    const t0 = Date.now();
+    let sessionId: string | null = null;
+    let bashTaskId: string | null = null;
+    let outputFile: string | null = null;      // 优先 notif/tool_result 给的
+    let fileFirstSeenAt: number | null = null;
+    let fileVanishedAt: number | null = null;
+    let notifAt: number | null = null;
+    let queryEndedAt: number | null = null;
+    const snaps: { t: number; exists: boolean; phase: string }[] = [];
+
+    const env = { ...BASE_ENV, OTEL_LOG_RAW_API_BODIES: `file:${dir}` };
+    // streaming generator：命令跑完后不立即结束输入流，多问一句拖住 query 存活，观测文件在 query 存活期是否还在
+    let resolveGate: () => void = () => {};
+    const gate = new Promise<void>((r) => { resolveGate = r; });
+    const gateTimeout = new Promise<void>((r) => setTimeout(r, 15000));
+    async function* promptInput(): AsyncIterable<any> {
+      yield { type: 'user', message: { role: 'user', content: `Use the Bash tool to run this exact command in the BACKGROUND (run_in_background:true): ${BG_CMD_41}. Report the task id.` }, parent_tool_use_id: null };
+      await Promise.race([gate, gateTimeout]);
+      yield { type: 'user', message: { role: 'user', content: 'Just say DONE.' }, parent_tool_use_id: null, priority: 'now' };
+    }
+
+    const resolvePath = (): string | null => {
+      if (outputFile) return outputFile;
+      if (sessionId && bashTaskId) {
+        const sanitized = process.cwd().replace(/[:\\/.]/g, '-');
+        const tmp = process.env.TEMP || process.env.TMP || 'C:\\Users\\14409~1.JER\\AppData\\Local\\Temp';
+        return `${tmp}\\claude\\${sanitized}\\${sessionId}\\tasks\\${bashTaskId}.output`;
+      }
+      return null;
+    };
+
+    const phaseOf = () => queryEndedAt !== null ? 'query结束后' : notifAt !== null ? '命令完成后' : '命令运行中';
+    const poller = setInterval(() => {
+      const t = Date.now() - t0;
+      const p = resolvePath();
+      if (p) {
+        const exists = existsSync(p);
+        if (exists && fileFirstSeenAt === null) { fileFirstSeenAt = t; console.error(`\n[${t}ms] .output 首现`); }
+        if (!exists && fileFirstSeenAt !== null && fileVanishedAt === null) { fileVanishedAt = t; console.error(`\n[${t}ms] ⚠️ .output 消失（存活约 ${t - fileFirstSeenAt}ms）`); }
+        snaps.push({ t, exists, phase: phaseOf() });
+        console.error(`[poll t=${t}ms] exists=${exists} 阶段=${phaseOf()}`);
+      }
+    }, 1000);
+
+    const events: CapturedSDKEvent[] = [];
+    let index = 0;
+    try {
+      const sdkQuery = query({ prompt: promptInput(), options: { env, includePartialMessages: true, persistSession: false, settingSources: [], effort: 'low', permissionMode: 'bypassPermissions' } as any });
+      for await (const message of sdkQuery) {
+        const msg = message as any;
+        const type = msg.type || 'unknown';
+        const rel = Date.now() - t0;
+        if (!sessionId && msg.session_id) sessionId = msg.session_id;
+        if (type === 'system') {
+          if (msg.subtype === 'task_started' && !bashTaskId) { bashTaskId = msg.task_id; if (msg.session_id) sessionId = msg.session_id; console.error(`\n[${rel}ms] task_started ${msg.task_id}`); }
+          if (msg.subtype === 'task_notification') { notifAt = rel; if (msg.output_file) outputFile = msg.output_file; console.error(`\n[${rel}ms] task_notification status=${msg.status} → 命令完成`); resolveGate(); }
+        }
+        if (type === 'user' && Array.isArray(msg.message?.content)) {
+          for (const b of msg.message.content) {
+            if (b.type === 'tool_result') {
+              const sn = typeof b.content === 'string' ? b.content : Array.isArray(b.content) ? b.content.map((c: any) => c.type === 'text' ? c.text : '').join('') : '';
+              const fm = sn.match(/written to:\s*([^\s"]+\.output)/i) || sn.match(/([A-Za-z]:\\[^\s"]+\.output)/);
+              if (fm && !outputFile) outputFile = fm[1];
+            }
+          }
+        }
+        if (type === 'result') { queryEndedAt = rel; console.error(`\n[${rel}ms] query 结束`); }
+        events.push({ index: index++, type, timestamp: Date.now(), subtype: msg.subtype });
+      }
+    } finally {
+      // query 结束后继续探 8 秒，看文件是否在 query 结束后才被删
+      for (let i = 0; i < 8; i++) {
+        await new Promise(r => setTimeout(r, 1000));
+        const t = Date.now() - t0;
+        const p = resolvePath();
+        if (p) {
+          const exists = existsSync(p);
+          if (!exists && fileFirstSeenAt !== null && fileVanishedAt === null) { fileVanishedAt = t; console.error(`\n[${t}ms] ⚠️ .output 消失（query 结束后）`); }
+          snaps.push({ t, exists, phase: 'query结束后探测' });
+          console.error(`[poll(post) t=${t}ms] exists=${exists}`);
+        }
+      }
+      clearInterval(poller);
+    }
+
+    const duration = Date.now() - t0;
+    const survivedMs = (fileFirstSeenAt !== null && fileVanishedAt !== null) ? fileVanishedAt - fileFirstSeenAt : null;
+    const vanishRelToNotif = (fileVanishedAt !== null && notifAt !== null) ? fileVanishedAt - notifAt : null;
+    const vanishRelToQueryEnd = (fileVanishedAt !== null && queryEndedAt !== null) ? fileVanishedAt - queryEndedAt : null;
+
+    console.error('\n══════ case-41 实测值（.output 存活时长）══════');
+    console.error(`[L1] 文件首现@${fileFirstSeenAt}ms，命令完成(notif)@${notifAt}ms，query结束@${queryEndedAt}ms`);
+    console.error(`[L2] 文件消失@${fileVanishedAt ?? '未观测到消失（探测期内一直在）'}ms`);
+    console.error(`[L3] 文件存活时长: ${survivedMs ?? '≥探测窗口'}ms`);
+    console.error(`[L4] 消失相对「命令完成」: ${vanishRelToNotif ?? '-'}ms；相对「query结束」: ${vanishRelToQueryEnd ?? '-'}ms`);
+    console.error(`【结论】.output 文件在${fileVanishedAt === null ? 'query 存活期一直存在（未被删）' : vanishRelToQueryEnd !== null && vanishRelToQueryEnd >= -1500 ? 'query 结束前后被删' : '命令完成后不久被删'}`);
+
+    writeFileSync(`${dir}/output-lifetime.json`, JSON.stringify({
+      sessionId, bashTaskId, outputFile: resolvePath(), fileFirstSeenAt, notifAt, queryEndedAt, fileVanishedAt,
+      survivedMs, vanishRelToNotif, vanishRelToQueryEnd, duration, snaps,
+    }, null, 2));
+
+    expect(events.length).toBeGreaterThan(0);
+  }, 120000);
+});
