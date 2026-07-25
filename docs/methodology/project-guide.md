@@ -288,7 +288,7 @@ Select-String -Path "test\integration\tmp\**\*.request.json" -Pattern "greet|jok
 | `sdk-custom-tool.spec.ts` | `sdk-custom-tool-behavior.md` |
 | `session-fork-uptomessage.spec.ts` | `session-fork-uptomessage-behavior.md` |
 | `workflow-tool-mechanism.spec.ts` | `workflow-tool-mechanism-behavior.md` |
-| `tool-foreground-background.spec.ts` | `tool-foreground-background-behavior.md` |
+| `tool-foreground-background.spec.ts` | `tool-foreground-background-behavior.md` + `id-hierarchy-and-relations.md`（id 体系知识图谱，同源实验衍生） |
 | `sprint-workflow-e2e.spec.ts` | `workflow-lifecycle-behavior.md` |
 | `session-state-lifecycle.spec.ts` | `workflow-lifecycle-behavior.md` |
 | `skill-injection-matrix.spec.ts` | `custom-skill-injection.md` *(早期文件)* |

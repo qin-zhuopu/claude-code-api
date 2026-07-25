@@ -35,6 +35,13 @@
 | 61 | **智谱 GLM（glm-5.2）能真正并发起 2 个前台 Bash**（同消息一次发出）—— 证实 case-22 的并发限制来自模型能力而非 SDK | Case 22b |
 | 62 | **无参 `backgroundTasks()` 一次批量转后台 2 个任务、返回 `true`** —— 首次压满「无参 = 后台化全部前台任务」的批量语义（TUI Ctrl+B） | Case 22b |
 | 63 | **换模型可作控制变量隔离「模型能力 vs SDK 机制」** —— 同一代码路径本地 LLM 转 1 个、GLM 转 2 个 | Case 22b |
+| 68 | **嵌套 subagent 三 id 同源**：subagent 内部 `assistant.parent_tool_use_id` == 外层 `Agent block.id` == `task_started.tool_use_id`（三者全等） | Case 24 |
+| 69 | **subagent 内部消息带 `subagent_type`（值 `general-purpose`）、`task_started` 亦带同名 subagent_type**；subagent 内部真的能再调 Bash（子 tool_use） | Case 24 |
+| 70 | **自动后台化的阻塞可被 `backgroundTasks(tool_use_id)` 解除**（自动后台化场景也返回 `true`）——沿用 case-17 铁律，等 task_started 后调即成功，无需 interrupt 兜底 | Case 25 |
+| 71 | **自动后台化任务转后台后 tool_result 带 `backgroundTaskId`（== task_id）**，第一轮 turn 立即结束（13.4s，未等满 sleep 40），可 streaming 续轮边聊 | Case 25 |
+| 72 | **显式后台 bash（run_in_background:true）能被 `stopTask` 终止**：dual-channel `task_updated.status=killed` + `task_notification.status=stopped`（相差 ~1ms），sleep 40 被真正中断 | Case 26 |
+| 73 | **`close()` 立即终止 query 迭代器**（~2s 内 for-await 退出），close 后【不再收到任何消息】——无 task_notification、无 result | Case 27 |
+| 74 | **`paused` 状态仍无法在 SDK query 层触发** —— backgroundTasks+interrupt+stopTask 组合只跑出 killed，未见 paused（补强 case-21 发现 58） | Case 28 |
 
 ---
 
@@ -472,12 +479,16 @@ SDK 注释（`sdk.d.ts:2496`）说返回 `false` 仅当「给了 toolUseId 但�
 
 1. ~~**`backgroundTasks()` 方法**~~ — **已验证（case-12/13，2026-07-23）**：方法存在且可调用，但本环境下对长任务返回 false（见上节）。剩余不确定点：极窄窗口内是否可成功。
 2. **Monitor 工具** — 需要 Anthropic 直连端点 + 遥测启用，本地环境不可用
-3. **前台→后台→前台完整状态机** — 部分验证（自动后台化已确认，但"手动转后台成功"未观测到）
+3. ~~**前台→后台→前台完整状态机**~~ — **已验证转后台方向（case-17/25）**：自动后台化 + 手动 backgroundTasks 转后台成功已确认。「后台→前台」（un-background）SDK 无对应控制方法，不存在此路径。
 4. ~~**task_progress 消息的完整结构**~~ — **已验证（case-20，2026-07-25）**：固定 10 键，usage.tool_uses/duration_ms 累加，含 subagent_type/last_tool_name/description；`summary` 可选常缺省，`total_tokens` 本地网关恒 0（见发现 51-55）
 5. ~~**`task_updated` 消息的用途**~~ — **已验证（case-21，2026-07-25）**：是「异常/停止」事件通道，patch 携带变化字段子集。首次触发 `killed`（patch 仅 `{status,end_time}`）；正常完成不发 task_updated（见发现 56-58）
 6. **SSE cases (9-11)** — NestJS 服务端 SSE 传输的 task 消息包装格式未验证
 7. **`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` 的真实影响范围** — 需要更精确的控制变量实验
 8. **长运行后台任务的 task_notification completed 状态** — case-2 因超时未等到 completed；case-12/13 已观测到 completed（但 output_file 为空）
+9. ~~**嵌套 subagent 的 id 父子链**~~ — **已验证（case-24，2026-07-25）**：subagent 内部 `assistant.parent_tool_use_id` == 外层 `Agent block.id` == `task_started.tool_use_id`（三者全等，见发现 68-69）
+10. ~~**close() 生命周期**~~ — **已验证（case-27，2026-07-25）**：close() 同步终止迭代器（~2s），之后不再收到任何消息（见发现 73）。剩余不确定点：close() 是否 100% 回收派生的后台进程（本 case 未拿到 output_file 逐秒验证）。
+11. **`paused` 状态触发路径** — case-21/28 均未在 SDK query 层触发到；推断仅 TUI 暂停/workflow 挂起场景产生。需查 CLI/TUI 源码坐实（见发现 74）
+12. **显式后台 bash 的 stopTask 终止** — **已验证（case-26，2026-07-25）**：run_in_background:true 的任务可被 stopTask 杀掉（killed+stopped 双通道，见发现 72）
 
 ---
 
@@ -735,13 +746,55 @@ case-18a（`seq 1 8`，16s）测出「前台 SDK 事件流无增量 stdout」，
 
 > ⚠️ **未完全坐实**：本项目只测 SDK `query()` 层，未直接测 TUI，无法 100% 断言「Ctrl+O 读的就是这个文件」。此结论是「文件实时增长（已证）+ Ctrl+O 是 transcript viewer（文档已证）」的强推断，非直接证据。要钉死需查 TUI 源码或在真实 TUI 中对照文件内容。
 
-### 输出可见性的完整图景（case-18 + case-19）
+### 输出可见性的完整图景（case-18 + case-19 + case-17b）
 
-| 视角 | 短前台命令 | 长前台命令（被自动后台化） | 显式后台命令 |
-|------|-----------|--------------------------|-------------|
-| SDK 事件流（query 调用方） | tool_result 一次性 | tool_result 一次性（事件流不逐字流 stdout） | tool_result 立即返回 backgroundTaskId |
-| `.output` 文件 | 可能不产生 | **实时增长，可 tail**（case-19） | **实时增长，可 tail**（case-18b） |
-| TUI Ctrl+O | 结束后展开看 | **实时可见（读 .output 文件，推断）** | 实时可见 |
+| 视角 | 短前台命令 | 长前台命令（被自动后台化） | 显式后台命令 | 手动转后台（backgroundTasks） |
+|------|-----------|--------------------------|-------------|------------------------------|
+| SDK 事件流（query 调用方） | tool_result 一次性 | tool_result 一次性（事件流不逐字流 stdout） | tool_result 立即返回 backgroundTaskId | tool_result 立即返回 backgroundTaskId |
+| `.output` 文件 | 可能不产生 | **实时增长，可 tail**（case-19） | **实时增长，可 tail**（case-18b） | **实时增长，可 tail**（case-17b） |
+| `output_file` 路径来源 | — | **notif 为 null，需 session_id+task_id 拼**（case-19） | tool_result 提示文本给 | **notif + tool_result 都给**（case-17b，无需拼） |
+| TUI Ctrl+O | 结束后展开看 | **实时可见（读 .output 文件，推断）** | 实时可见 | 实时可见 |
+
+> **三种后台路径输出可读性已全部实测**：显式后台（case-18b）、自动后台化（case-19）、手动转后台（case-17b）三条路径的 `.output` 文件**都能在任务运行期间实时 tail 到增量**。关键差异只在 `output_file` 路径的获取方式：**只有自动后台化的 `task_notification.output_file` 为 null（须自己用 session_id+task_id 拼），显式后台和手动转后台都直接在 tool_result / notification 里给出路径**。
+
+---
+
+## 手动转后台的输出可读性（case-17b）
+
+> 调研人：Claude Code
+> 日期：2026-07-25
+> 环境：同 case-14~19（LOCAL 网关 `10.1.3.115:4000` / `Jereh-LLM-NO-THINK-V1`），`permissionMode: bypassPermissions`，`settingSources: []`，`effort: low`
+> 目的：补齐 case-17 的空白 —— case-17 只证明了「等 task_started 后调 `backgroundTasks(toolUseId)` 转后台成功」（返回 true、tool_result 带 backgroundTaskId、turn 解阻塞），但**没有在任务后台运行期间读 `.output` 文件的增量**。对照 case-18b（显式后台）和 case-19（自动后台化）都测了「运行中拿路径 + 读增量」，手动转后台这条路径此前是空白。
+
+### 实验设计
+
+在 case-17 的手动转后台逻辑上叠加 case-18b/19 的「每秒读 `.output`」观察者，用慢速分批命令 `for i in $(seq 1 8); do echo tick-$i; sleep 2; done`（约 16s，8 行）。候选路径优先用 `task_notification.output_file`，其次 tool_result 提示文本，最后用 `session_id + task_id` 拼。
+
+### 核心发现
+
+| # | 发现 | 证据（case-17b 实测） |
+|---|------|---------------------|
+| 64 | **手动转后台后 `.output` 文件实时增长，可 tail** —— 与 case-18b/19 一致，手动转后台不是「输出黑洞」 | 逐秒命中：14118ms→3 行(tick-3)、16147ms→4、18163ms→5、21196ms→6、23220ms→7、25227ms→8，每 ~2s +1 行；`maxLines: 8` |
+| 65 | **手动转后台的 `output_file` 路径【两条通道都给】**（notif 和 tool_result 值相同）—— 无需像自动后台化那样自己拼 | `outputFileFromNotif` 与 `outputFileFromResult` 均为 `...tasks/byvx0or21.output`（相等） |
+| 66 | **backgroundTaskId == task_id == .output 文件名主干** | `backgroundTaskIdFromResult: byvx0or21` = `bashTaskId: byvx0or21` = 文件名 `byvx0or21.output` |
+| 67 | **backgroundTasks 返回 true 与 task_started 同刻**（沿用 case-17 铁律：须在 task_started 后调） | `bgCallResult: true`（@12379ms，taskStartedAt 同@12379ms） |
+
+### 关键时序（case-17b）
+
+```
+t+12379ms  task_started（task_id=byvx0or21）+ backgroundTasks(toolUseId) → true
+           （notif 和 tool_result 都给出 output_file 路径）
+t+14118ms  .output 文件读到 3 行（tick-1..tick-3）
+t+16147ms  4 行 ... 逐级 +1 ...
+t+25227ms  8 行（tick-8，命令产出完毕）
+t+26524ms  notifStatus=stopped，query 结束
+```
+
+### 结论：修正 case-14/19 引发的担心
+
+此前基于 case-14（backgroundTasks false 时 output_file=null）和 case-19（自动后台化 notif.output_file=null）的观察，**曾担心手动转后台可能也拿不到 output 路径**。case-17b 实测**推翻此担心**：手动转后台（backgroundTasks 成功）走的是与显式后台（case-18b）相同的通道 —— `output_file` 在 notif 和 tool_result 里都有值、`.output` 文件实时增长、可直接 tail，**无需用 session_id+task_id 拼路径**。
+
+**对 CodePilot 的实际影响**：手动把长命令转后台后，可直接用 `task_notification.output_file`（或 tool_result 里的路径）去 tail 实时输出。只有「自动后台化」（LLM 没主动 run_in_background，命令跑太久被 SDK 自动转后台）才需要自己用 session_id+task_id 拼路径。
 
 ---
 
@@ -865,3 +918,107 @@ t+28151ms  task_notification bzrnz09jq status=stopped
 1. **task_progress 可驱动"运行中进度"UI**：用 `usage.tool_uses`/`duration_ms` 做进度指示，`description`/`last_tool_name` 做当前动作文案，`subagent_type` 分发组件。注意 `total_tokens` 在本地网关恒 0、`summary` 可能缺省，UI 需容错。
 2. **task_updated 是"异常/停止"通道，不是"每步状态"通道**：正常完成的任务【不发】task_updated，只发 task_notification。渲染状态流转时，`killed` 来自 task_updated.patch，而 `stopped/completed/failed` 来自 task_notification —— **两个通道要合并去重**（同一次停止会同时来 killed + stopped）。
 3. **无参 backgroundTasks() 可作"全部转后台"按钮**（Ctrl+B 语义），返回 true 即解除阻塞。但要注意任务须已 task_started（沿用 case-17 铁律）。
+
+---
+
+## 生命周期补 5 缺口（case-24 ~ case-28）
+
+> 调研人：Claude Code
+> 日期：2026-07-25
+> 环境：同 case-14~22（LOCAL 网关 `10.1.3.115:4000` / `Jereh-LLM-NO-THINK-V1`），`permissionMode: bypassPermissions`，`settingSources: []`，`effort: low`
+> 目的：钉死覆盖审视发现的 5 处生命周期缺口 —— 嵌套 subagent 的 id 父子链（case-24）、自动后台化后解除阻塞边聊（case-25，最核心）、显式后台 bash 的 stopTask 终止（case-26）、close() 生命周期（case-27）、paused 状态触发尝试（case-28）。
+
+### case-24：嵌套 subagent 的 id 指向（三 id 同源）
+
+用 Agent 工具启动一个 `general-purpose` subagent，让 subagent 内部再调 Bash（`echo nested-subagent-bash-24`）。实测 subagent 内部真的展开了 2 条 assistant 消息，其中一条调了 Bash 子工具。
+
+| # | 发现 | 证据（case-24 实测） |
+|---|------|---------------------|
+| 68 | **三 id 全等**：subagent 内部 `assistant.parent_tool_use_id` == 外层 `Agent block.id` == `task_started.tool_use_id` | 三者均为 `call_1c1aa79a8d0e495480fec549` |
+| 69 | **subagent 内部消息带 `subagent_type=general-purpose`**，`task_started` 亦带同名字段；subagent 内部确实再调了 Bash（子 tool_use `call_0d1942a8...`） | `subagentAssistantCount:2`，`subagentBashCalls:[{Bash}]` |
+
+**父子链（钉死）**：
+```
+主线程 assistant [Agent] block.id=call_1c1aa79a...   ← 顶层，parent_tool_use_id=null
+   │
+   ├─ task_started task_id=a2cb1138... tool_use_id=call_1c1aa79a...  ← tool_use_id 指回 Agent block
+   │                task_type=local_agent, subagent_type=general-purpose
+   │
+   └─ subagent 内部 assistant  parent_tool_use_id=call_1c1aa79a...   ← 指回外层 Agent block
+                               subagent_type=general-purpose
+        └─ 子 tool_use [Bash] id=call_0d1942a8...   ← subagent 内部再调 Bash
+```
+
+**结论**：要把 subagent 内部消息归属到发起它的 Agent 调用，用 `parent_tool_use_id` 匹配外层 `Agent tool_use block.id`（也等于 `task_started.tool_use_id`）。这三个 id 是同一个值，CodePilot 可用它建立"主线程 tool_use → subagent → 子 tool_use"的树形归属。
+
+### case-25：自动后台化后解除阻塞、边聊边执行（最核心，三路径对照）
+
+streaming-input 模式，msg1 让 LLM 跑 `sleep 40 && echo bg-25-done`（明确 run_in_background:false → 触发自动后台化 → 阻塞）。依次尝试：路径1 `backgroundTasks(task_started.tool_use_id)`，路径2 若无效则同步 `interrupt()`。
+
+| # | 发现 | 证据（case-25 实测） |
+|---|------|---------------------|
+| 70 | **自动后台化的阻塞可被 `backgroundTasks(tool_use_id)` 解除**（返回 `true`）—— 无需 interrupt 兜底，路径1 直接成功 | `bgCallResult:true`（@12369ms，task_started 同@12369ms）；`interruptCallResult:NOT_CALLED`（路径2 未触发） |
+| 71 | **转后台后 tool_result 带 `backgroundTaskId`（== task_id `b0sz2or16`）**，第一轮 turn 在 13385ms 结束（未等满 sleep 40），streaming 续轮成功 | `firstTurnEndedAt:13385`，`unblockedBeforeSleepDone:true`，`turn2Reached:true`，`turnsObserved:2` |
+
+**三路径对照结论**：
+- **路径1（backgroundTasks）成功**：自动后台化场景下，等 task_started 后调 `backgroundTasks(tool_use_id)` 同样返回 `true` 并解除阻塞——与 case-17（LLM 明确前台的长命令）行为一致。**关键仍是"等 task_started 后调用"这条铁律**，与命令是"自动后台化"还是"LLM 声明前台"无关。
+- **路径2（interrupt）未触发**：因为路径1 已成功，interrupt 兜底逻辑没有执行。
+- **路径3（结论）**：自动后台化的阻塞，**靠 `backgroundTasks(tool_use_id)` 就能干净解除**（返回 true、tool_result 带 backgroundTaskId、turn 立即结束、可边聊边等后台完成）。这直接回答产品问题：**能边聊边等后台 bash 完成，且首选 backgroundTasks 而非 interrupt**（interrupt 会打断整个 turn，backgroundTasks 只转后台不打断）。
+
+**关键时序（case-25）**：
+```
+t+12369ms  task_started task_id=b0sz2or16（自动后台化）+ backgroundTasks(tool_use_id) → true
+t+13385ms  第一轮 result（turn 结束，未等满 sleep 40）
+（streaming 续推 msg2 问"任务好了吗"，turnsObserved=2）
+t+17400ms  query 结束（result.subtype=success, terminal_reason=completed）
+t+22479ms  task_notification status=stopped（后台任务终结信号，此时 query 已结束）
+```
+
+> ⚠️ 注意 `task_notification.status=stopped`（非 completed）：因为 query 在 17400ms 就结束了，而 sleep 40 未跑完，query 收尾时后台任务被停 → stopped。若要等 completed，需保持 query 存活到 sleep 40 自然结束。
+
+### case-26：stopTask 终止显式后台 bash（run_in_background:true）
+
+case-15 停的是"LLM run_in_background:false 后被自动/手动后台化"的任务。本 case 专门停【显式后台】bash：LLM 主动 `run_in_background:true` 起 `sleep 40`，等 task_started 后 `stopTask(taskId)`。
+
+| # | 发现 | 证据（case-26 实测） |
+|---|------|---------------------|
+| 72 | **显式后台 bash 能被 stopTask 终止**，dual-channel `task_updated.status=killed` + `task_notification.status=stopped`（相差 ~1ms：8759/8760ms），sleep 40 被真正中断 | `stopCallResult:OK`，`sawKilled:true`，`taskNotificationStatus:stopped`，`killedInterrupted:true`（duration 21120ms） |
+
+**与 case-15 对照**：两种后台任务（显式 run_in_background:true vs 被后台化的前台任务）的 stopTask 行为**完全一致** —— 都是 killed（task_updated）+ stopped（task_notification）双通道、query 存活可续轮（turnsObserved=4, turn2Reached）、result.subtype=success。**显式后台任务的 tool_result 带 backgroundTaskId（`bbrt41p0g` == task_id）**，这点与 case-2 一致，区别于自动后台化（case-12/13 不带）。
+
+### case-27：close() 生命周期（关闭会话 → 后台任务命运）
+
+streaming-input 起显式后台 bash（sleep 40），等 task_started 后调 `queryHandle.close()`，观察 close 后行为。
+
+| # | 发现 | 证据（case-27 实测） |
+|---|------|---------------------|
+| 73 | **close() 立即终止迭代器**（close@8863ms → for-await 退出@10872ms，~2s 内），close 后【不再收到任何消息】——无 task_notification、无 result | `iteratorEndedFastAfterClose:true`，`messagesAfterClose:[]`，`taskNotificationAfterClose:false`，`resultAfterClose:false` |
+
+**close() 行为链**：
+- close() 是**同步方法**（返回 void，不抛错）。
+- 调用后 for-await 在 ~2s 内正常结束（非抛错退出）。
+- **close 后彻底静默**：没有 task_notification（后台任务的终结信号收不到）、没有 result 消息。
+- 本 case 因 close 发生在 task_started 时刻（output_file 路径尚未通过 notification/tool_result 送达），未能拿到 output_file 路径，故无法直接观测"后台进程是否变孤儿"。
+
+> ⚠️ **孤儿任务问题部分未决**：close() 会"forcefully ends the query, cleaning up all resources including ... the CLI subprocess"（sdk.d.ts:2513-2515）。CLI 子进程被杀，其派生的后台 bash 进程**理论上**应随之终止（进程树），但本 case 未拿到 output_file 无法逐秒验证文件是否停止增长。**对 CodePilot 的建议**：关闭会话若想干净停掉后台任务，优先显式 `stopTask(taskId)`（case-26 已证能杀）再 `close()`，不要指望 close() 单独保证后台进程被回收。
+
+### case-28：尝试触发 paused 状态（探索性，否定发现）
+
+起显式后台 bash（sleep 40），等 task_started 后依次组合 `backgroundTasks → interrupt → stopTask`，收集所有 task_updated.patch.status，看能否触发 `paused`。
+
+| # | 发现 | 证据（case-28 实测） |
+|---|------|---------------------|
+| 74 | **paused 仍无法在 SDK query 层触发** —— 组合三控制方法只跑出 killed，未见 paused（补强 case-21 发现 58） | `sawPaused:false`，`distinctStatuses:["killed"]`；`backgroundTasks` 此次返回 false（stopTask 前该显式后台任务已非"前台任务"），interrupt 未记录（组合序列因 stopTask 收尾提前结束） |
+
+**否定发现 + 原因推断**：
+- 组合 `backgroundTasks(false) → stopTask(→killed/stopped)` 后 query 在 13644ms 结束，`interrupt` 动作因收尾未及执行。最终只产生 `task_updated.status=killed`。
+- **paused 在本环境（SDK query 控制方法层）无触发路径**。SDK 六态（pending/running/completed/failed/killed/paused）中，query 层实测只观测到 `killed`（stopTask 触发）和隐含 `running`。
+- **推断**：`paused` 可能仅在 **TUI 交互暂停**（如某种 pause 快捷键）或**特定 workflow 场景**（workflow 引擎主动挂起某步）下由 CLI 内部产生，**SDK query 的三个控制方法（backgroundTasks/stopTask/interrupt）都不会把任务置为 paused**。要坐实 paused 的触发路径，需查 CLI/TUI 源码或在真实 TUI 中操作。
+
+### 5 case 对 CodePilot 的实际影响
+
+1. **subagent 消息归属用 parent_tool_use_id**（case-24）：subagent 内部所有消息的 `parent_tool_use_id` 都指向外层 `Agent tool_use block.id`（也等于 `task_started.tool_use_id`）。用它建 tool_use 树，把 subagent 内部的 Bash/文本正确挂到发起它的 Agent 节点下。
+2. **"边聊边等后台"首选 backgroundTasks 而非 interrupt**（case-25）：自动后台化的长命令阻塞，等 task_started 后调 `backgroundTasks(tool_use_id)` 即解除，turn 立即结束、可续轮问 AI，后台任务继续跑。interrupt 会打断整个 turn，不适合"转后台继续聊"。
+3. **停后台任务 backgroundTasks 与 stopTask 都要等 task_started**（case-26，铁律再确认）：显式后台任务用 `stopTask(taskId)` 能干净杀掉（killed+stopped 双通道），与被后台化的前台任务行为一致。渲染时两通道去重。
+4. **关闭会话 = 先 stopTask 再 close**（case-27）：close() 同步终止 query、之后彻底静默（无 notification/result）。想干净停后台任务，先显式 stopTask 再 close，不要只靠 close() 回收后台进程。
+5. **不要期待 paused 状态**（case-28）：SDK query 层跑不出 paused，状态机 UI 只需处理 pending/running/completed/failed/killed/stopped，paused 可暂不实现（或标注"仅 TUI/workflow"）。

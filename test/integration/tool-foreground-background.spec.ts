@@ -2525,6 +2525,221 @@ describe('task_started 后调 backgroundTasks', () => {
   }, 240000);
 });
 
+// ====== 手动转后台的输出可读性（case-17b）======
+//
+// 缘起：case-17 证明了「等 task_started 后调 backgroundTasks(toolUseId) 转后台成功」，
+// 但它【只】验证了转后台本身（返回 true、tool_result 带 backgroundTaskId、turn 解阻塞），
+// 【没有】在任务后台运行期间去读 .output 文件的增量。
+// 对照：case-18b（显式 run_in_background:true）和 case-19（自动后台化）都实测了
+// 「运行中能拿到 output 路径 + 能读增量内容」。手动转后台这条路径是空白。
+//
+// 本 case 在 case-17 转后台逻辑上叠加 case-18b/19 的「每秒读 .output」观察，验证：
+//   W1 手动转后台后，tool_result / task_notification 给的 output_file 是有值还是 null？
+//   W2 用 task_started.task_id 拼路径 {tmp}/claude/{sanitized-cwd}/{session_id}/tasks/{task_id}.output
+//      能否读到？内容是否随命令产出实时增长？
+//   W3 若两条路径都拿不到 output，如实记为否定发现。
+// 命令用慢速分批：for i in $(seq 1 8); do echo tick-$i; sleep 2; done（约 16s，8 行）。
+
+describe('手动转后台的输出可读性', () => {
+  const SLOW_CMD_17B = 'for i in $(seq 1 8); do echo tick-$i; sleep 2; done';
+
+  it('case-17b backgroundTasks 转后台后能否实时读 .output', async () => {
+    const dir = createTimestampDir('tool-foreground-background/case-17b-bg-output-readable');
+
+    const t0 = Date.now();
+    const state = {
+      bashToolUseId: null as string | null,
+      taskStartedToolUseId: null as string | null,
+      bashTaskId: null as string | null,
+      sessionId: null as string | null,
+      taskStartedAt: null as number | null,
+      bgCallResult: 'NOT_CALLED' as boolean | 'NOT_CALLED' | 'NO_METHOD' | string,
+      bgCallAt: null as number | null,
+      backgroundTaskIdFromResult: null as string | null,
+      outputFileFromResult: null as string | null,   // tool_result 提示文本里的 .output
+      outputFileFromNotif: null as string | null,     // task_notification.output_file
+      notifStatus: null as string | null,
+      queryEnded: false,
+      queryEndedAt: null as number | null,
+    };
+
+    // 候选 .output 路径：优先 notif 给的，其次 tool_result 给的，最后用 task_id 拼
+    const { tmpdir } = await import('os');
+    const { join } = await import('path');
+    function candidatePaths(): string[] {
+      const paths: string[] = [];
+      if (state.outputFileFromNotif) paths.push(state.outputFileFromNotif);
+      if (state.outputFileFromResult) paths.push(state.outputFileFromResult);
+      // 拼路径：sanitized-cwd 规则参考 case-19（把盘符/分隔符做替换）
+      if (state.sessionId && state.bashTaskId) {
+        const sanitizedCwd = process.cwd().replace(/[:\\/]/g, '-');
+        paths.push(join(tmpdir(), 'claude', sanitizedCwd, state.sessionId, 'tasks', `${state.bashTaskId}.output`));
+      }
+      return [...new Set(paths)];
+    }
+
+    const fileSnapshots: any[] = [];
+    const poller = setInterval(() => {
+      const t = Date.now() - t0;
+      const cands = candidatePaths();
+      let hit: { path: string; lineCount: number; lastTick: string | null } | null = null;
+      for (const p of cands) {
+        if (existsSync(p)) {
+          try {
+            const c = readFileSync(p, 'utf-8');
+            const ticks = c.match(/tick-\d+/g) || [];
+            hit = { path: p, lineCount: ticks.length, lastTick: ticks[ticks.length - 1] ?? null };
+            break;
+          } catch { /* 正被写，忽略 */ }
+        }
+      }
+      fileSnapshots.push({ t, candCount: cands.length, hit });
+      console.error(`[poll t=${t}ms] 候选路径=${cands.length} 命中=${hit ? `${hit.lineCount}行(${hit.lastTick})` : '无'} bgCall=${state.bgCallResult}`);
+    }, 1000);
+
+    let resolveTurn2: () => void = () => {};
+    const turn2Gate = new Promise<void>((r) => { resolveTurn2 = r; });
+    const turn2Timeout = new Promise<void>((r) => setTimeout(r, 30000));
+
+    const msg1: any = {
+      type: 'user',
+      message: { role: 'user', content: `Use the Bash tool to run this exact command in the FOREGROUND (do NOT set run_in_background): ${SLOW_CMD_17B}` },
+      parent_tool_use_id: null,
+    };
+    const msg2: any = {
+      type: 'user',
+      message: { role: 'user', content: 'Is the background task done? Just answer yes or no.' },
+      parent_tool_use_id: null,
+      priority: 'now',
+    };
+    async function* promptInput(): AsyncIterable<any> {
+      yield msg1;
+      await Promise.race([turn2Gate, turn2Timeout]);
+      yield msg2;
+    }
+
+    const env = { ...BASE_ENV, OTEL_LOG_RAW_API_BODIES: `file:${dir}` };
+    const sdkQuery = query({
+      prompt: promptInput(),
+      options: { env, includePartialMessages: true, persistSession: false, settingSources: [], effort: 'low', permissionMode: 'bypassPermissions' } as any,
+    });
+    const queryHandle: any = sdkQuery;
+
+    const events: CapturedSDKEvent[] = [];
+    let index = 0;
+    try {
+      for await (const message of sdkQuery) {
+        const msg = message as any;
+        const type = msg.type || 'unknown';
+        const rel = Date.now() - t0;
+        const captured: CapturedSDKEvent = { index: index++, type, timestamp: Date.now() };
+
+        if (type === 'system') {
+          captured.subtype = msg.subtype;
+          if (msg.subtype === 'init' && msg.session_id && !state.sessionId) {
+            state.sessionId = msg.session_id;
+          }
+          if (msg.subtype === 'task_started' && !state.bashTaskId) {
+            state.bashTaskId = msg.task_id;
+            state.taskStartedToolUseId = msg.tool_use_id ?? null;
+            state.sessionId = state.sessionId || msg.session_id || null;
+            state.taskStartedAt = rel;
+            console.error(`\n[${rel}ms] task_started task_id=${msg.task_id} tool_use_id=${msg.tool_use_id} session=${state.sessionId}`);
+          }
+          if (msg.subtype === 'task_notification') {
+            state.notifStatus = msg.status;
+            if (msg.output_file) state.outputFileFromNotif = msg.output_file;
+            console.error(`\n[${rel}ms] task_notification status=${msg.status} output_file="${msg.output_file}"`);
+            resolveTurn2();
+          }
+        }
+
+        if (type === 'assistant' && msg.message?.content) {
+          for (const block of msg.message.content) {
+            if (block.type === 'tool_use' && block.name === 'Bash' && !state.bashToolUseId) {
+              state.bashToolUseId = block.id;
+            }
+          }
+        }
+
+        if (type === 'user') {
+          const cb = Array.isArray(msg.message?.content) ? msg.message.content : [];
+          for (const b of cb) {
+            if (b.type === 'tool_result') {
+              const snippet = typeof b.content === 'string' ? b.content
+                : Array.isArray(b.content) ? b.content.map((c: any) => (c.type === 'text' ? c.text : '')).join('') : '';
+              const m = snippet.match(/backgroundTaskId["']?\s*[:=]\s*["']?([A-Za-z0-9_-]+)/i) || snippet.match(/ID:\s*([A-Za-z0-9_-]+)/i);
+              if (m && !state.backgroundTaskIdFromResult) state.backgroundTaskIdFromResult = m[1];
+              const fm = snippet.match(/written to:\s*([^\s"]+\.output)/i) || snippet.match(/([A-Za-z]:\\[^\s"]+\.output)/);
+              if (fm && !state.outputFileFromResult) state.outputFileFromResult = fm[1];
+            }
+          }
+        }
+
+        if (type === 'result') {
+          state.queryEnded = true;
+          state.queryEndedAt = rel;
+          resolveTurn2();
+        }
+
+        events.push(captured);
+
+        // 等 task_started 后调 backgroundTasks（沿用 case-17 铁律）
+        if (state.bashTaskId && state.bgCallResult === 'NOT_CALLED') {
+          const idToUse = state.taskStartedToolUseId || state.bashToolUseId;
+          state.bgCallAt = rel;
+          console.error(`\n[backgroundTasks] 等到 task_started 后调用 @ ${rel}ms，用 id=${idToUse}`);
+          try {
+            state.bgCallResult = typeof queryHandle.backgroundTasks === 'function'
+              ? await queryHandle.backgroundTasks(idToUse)
+              : 'NO_METHOD';
+          } catch (e: any) {
+            state.bgCallResult = `ERROR: ${e?.message || e}`;
+          }
+          console.error(`[backgroundTasks] 返回: ${state.bgCallResult}`);
+        }
+      }
+    } finally {
+      clearInterval(poller);
+    }
+
+    const duration = Date.now() - t0;
+
+    // 分析文件增长
+    const hits = fileSnapshots.filter(s => s.hit);
+    const maxLines = Math.max(0, ...hits.map(s => s.hit.lineCount));
+    const growthSteps = hits.filter((s, i) => i === 0 || s.hit.lineCount !== hits[i - 1].hit.lineCount);
+    const grewOverTime = growthSteps.length > 1 && maxLines > 1;
+    const gotPath = state.outputFileFromNotif || state.outputFileFromResult || (state.sessionId && state.bashTaskId ? 'via-taskid拼接' : null);
+
+    console.error('\n══════ W1-W3 实测值（手动转后台输出可读性）══════');
+    console.error(`[W1] backgroundTasks 返回: ${state.bgCallResult}（@${state.bgCallAt}ms，task_started@${state.taskStartedAt}ms）`);
+    console.error(`[W1] output_file 来源: notif="${state.outputFileFromNotif}" result="${state.outputFileFromResult}" | backgroundTaskId=${state.backgroundTaskIdFromResult}`);
+    console.error(`[W2] 运行中拿到可读路径? ${gotPath ? '是' : '否'}；文件是否实时增长? ${grewOverTime}（maxLines=${maxLines}）`);
+    console.error(`[W2] 增长阶梯: ${JSON.stringify(growthSteps.map(s => ({ t: s.t, lines: s.hit.lineCount, last: s.hit.lastTick })))}`);
+    console.error(`[W3] notifStatus=${state.notifStatus}; queryEnded@${state.queryEndedAt}ms; 总耗时=${duration}ms`);
+
+    writeFileSync(`${dir}/sdk-events.json`, JSON.stringify(events, null, 2));
+    writeFileSync(`${dir}/bg-output-readable.json`, JSON.stringify({
+      bgCallResult: state.bgCallResult, bgCallAt: state.bgCallAt, taskStartedAt: state.taskStartedAt,
+      bashTaskId: state.bashTaskId, sessionId: state.sessionId,
+      outputFileFromNotif: state.outputFileFromNotif, outputFileFromResult: state.outputFileFromResult,
+      backgroundTaskIdFromResult: state.backgroundTaskIdFromResult,
+      gotPath: !!gotPath, grewOverTime, maxLines, growthSteps, fileSnapshots,
+      notifStatus: state.notifStatus, queryEnded: state.queryEnded, queryEndedAt: state.queryEndedAt, duration,
+    }, null, 2));
+
+    // ── 断言（宽松，先观察）──
+    expect(events.length).toBeGreaterThan(0);
+    expect(state.bgCallResult).not.toBe('NOT_CALLED');
+    if (grewOverTime) {
+      console.error(`[发现] ✅ 手动转后台后 .output 文件实时增长（maxLines=${maxLines}）—— 与 case-18b/19 一致`);
+    } else {
+      console.error(`[否定发现] 手动转后台后未读到实时增长的 .output（gotPath=${!!gotPath}, maxLines=${maxLines}）—— 可能路径不可拼/文件不写/命令太短`);
+    }
+  }, 180000);
+});
+
 // ====== 前台/后台输出实时性验证（case-18）======
 //
 // 缘起：此前对"前台 Bash 输出是一次性返回"的说法，是从 case-1（echo 瞬时命令）
@@ -3675,6 +3890,1056 @@ describe('backgroundTasks() 无参批量 — 智谱 GLM 并发验证', () => {
       console.error(`[发现] ✅ GLM 起了 ${state.taskStartedIds.length} 个并发前台任务 —— 无参 backgroundTasks 批量语义得到验证`);
     } else {
       console.error(`[否定发现] GLM 仍只起 ${state.taskStartedIds.length} 个 task_started —— 并发受限可能来自 SDK 工具层而非模型能力`);
+    }
+  }, 120000);
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 生命周期补 5 case（case-24 ~ case-28）
+//
+// 缘起：覆盖审视发现 SDK 的 4 种 task 消息（task_started/notification/progress/
+// updated）和 8 个 Query 控制方法（interrupt/stopTask/backgroundTasks[有参/无参]/
+// streamInput/close/supportedCommands/mcpServerStatus）里，还有几处生命周期缺口：
+//   · case-24 嵌套 subagent 的 id 父子链（parent_tool_use_id / subagent_type）
+//   · case-25 自动后台化后如何解除阻塞、边聊边执行（三路径对照，最核心）
+//   · case-26 显式后台 bash（run_in_background:true）能否被 stopTask 终止（对照 case-15）
+//   · case-27 query 运行期有后台 bash 时调 close() 的行为（会话关闭 → 孤儿任务？）
+//   · case-28 尝试触发 task_updated.patch.status=paused（探索性，SDK 六态最后一个未观测）
+//
+// 沿用铁律（case-13→17）：控制方法（backgroundTasks/stopTask）必须在收到
+// task_started 事件【之后】调用才生效。interrupt() 只在 turn 活跃窗口内同步调用有效。
+// ══════════════════════════════════════════════════════════════════
+
+// ====== 嵌套 subagent 的 id 指向（case-24）======
+//
+// 目标：钉死"主线程 tool_use → subagent → 子 tool_use"的父子链。
+// 用 Agent 工具启动一个 subagent，让 subagent 内部再调 Bash。实测三条 id：
+//   T1 assistant 消息的 parent_tool_use_id（sdk.d.ts:2765）——subagent 内部的
+//      assistant 消息，其 parent_tool_use_id 是否等于发起它的 Agent tool_use block.id？
+//   T2 assistant 消息的 subagent_type（sdk.d.ts:2777）
+//   T3 task_started 的 subagent_type
+// 重点断言：subagent 内部 assistant.parent_tool_use_id === 外层 Agent 的 block.id。
+
+describe('嵌套 subagent id 指向', () => {
+  it('case-24 subagent 内部消息的 parent_tool_use_id 指向外层 Agent block.id', async () => {
+    const dir = createTimestampDir('tool-foreground-background/case-24-nested-subagent-id');
+
+    const t0 = Date.now();
+    const env = { ...BASE_ENV, OTEL_LOG_RAW_API_BODIES: `file:${dir}` };
+
+    const sdkQuery = query({
+      prompt: `Use the Agent tool to launch a subagent. Instruct the subagent to use the Bash tool to run the command "echo nested-subagent-bash-24" and report the output. Then tell me the subagent's result.`,
+      options: { env, includePartialMessages: true, persistSession: false, settingSources: [], effort: 'low', permissionMode: 'bypassPermissions' } as any,
+    });
+
+    // 记录每条 assistant 消息的 parent_tool_use_id / subagent_type，以及其中的 tool_use block
+    interface AssistantSnap {
+      relMs: number;
+      parent_tool_use_id: string | null;
+      subagent_type: string | null;
+      task_description: string | null;
+      toolUses: { name: string; id: string }[];
+      textSnippet: string | null;
+    }
+    const assistantSnaps: AssistantSnap[] = [];
+    // 外层 Agent tool_use 的 block.id（顶层 assistant 里出现的 Agent 工具）
+    let agentToolUseId: string | null = null;
+    // task_started 详情
+    interface TaskStartedSnap { relMs: number; task_id: string; task_type: string | null; tool_use_id: string | null; subagent_type: string | null; rawKeys: string[]; }
+    const taskStartedSnaps: TaskStartedSnap[] = [];
+
+    const events: CapturedSDKEvent[] = [];
+    let index = 0;
+    for await (const message of sdkQuery) {
+      const msg = message as any;
+      const type = msg.type || 'unknown';
+      const rel = Date.now() - t0;
+      const captured: CapturedSDKEvent = { index: index++, type, timestamp: Date.now() };
+
+      if (type === 'stream_event' && msg.event) {
+        captured.eventType = msg.event.type;
+        if (msg.event.type === 'content_block_delta' && msg.event.delta?.type === 'text_delta') {
+          process.stderr.write(msg.event.delta.text);
+        }
+      }
+
+      if (type === 'system') {
+        captured.subtype = msg.subtype;
+        if (msg.subtype === 'task_started') {
+          captured.taskId = msg.task_id;
+          captured.taskType = msg.task_type;
+          captured.raw = { ...msg };
+          taskStartedSnaps.push({
+            relMs: rel,
+            task_id: msg.task_id,
+            task_type: msg.task_type ?? null,
+            tool_use_id: msg.tool_use_id ?? null,
+            subagent_type: msg.subagent_type ?? null,
+            rawKeys: Object.keys(msg),
+          });
+          console.error(`\n[${rel}ms] task_started task_id=${msg.task_id} task_type=${msg.task_type} tool_use_id=${msg.tool_use_id} subagent_type=${msg.subagent_type ?? '-'}`);
+        }
+      }
+
+      if (type === 'assistant' && msg.message?.content) {
+        const toolUses: { name: string; id: string }[] = [];
+        let textSnippet: string | null = null;
+        for (const block of msg.message.content) {
+          if (block.type === 'tool_use') {
+            toolUses.push({ name: block.name, id: block.id });
+            captured.toolName = block.name;
+            captured.toolUseId = block.id;
+            // 顶层（parent_tool_use_id==null）的 Agent 工具 → 记其 block.id
+            if (block.name === 'Agent' && msg.parent_tool_use_id == null && !agentToolUseId) {
+              agentToolUseId = block.id;
+            }
+          }
+          if (block.type === 'text' && !textSnippet) {
+            textSnippet = block.text?.substring(0, 120) ?? null;
+          }
+        }
+        assistantSnaps.push({
+          relMs: rel,
+          parent_tool_use_id: msg.parent_tool_use_id ?? null,
+          subagent_type: msg.subagent_type ?? null,
+          task_description: msg.task_description ?? null,
+          toolUses,
+          textSnippet,
+        });
+        console.error(`\n[${rel}ms] assistant parent_tool_use_id=${msg.parent_tool_use_id ?? 'null'} subagent_type=${msg.subagent_type ?? '-'} tools=[${toolUses.map(t => t.name).join(',')}]`);
+      }
+
+      events.push(captured);
+    }
+
+    const duration = Date.now() - t0;
+
+    // 分析：找出 parent_tool_use_id 非 null 的 assistant（即 subagent 内部消息）
+    const subagentAssistants = assistantSnaps.filter(a => a.parent_tool_use_id != null);
+    // subagent 内部是否调了 Bash
+    const subagentBashCalls = subagentAssistants.flatMap(a => a.toolUses.filter(t => t.name === 'Bash'));
+    // parent_tool_use_id 的取值集合
+    const parentIds = [...new Set(subagentAssistants.map(a => a.parent_tool_use_id))];
+    // subagent 内部 assistant 的 parent_tool_use_id 是否 == 外层 Agent block.id
+    const parentMatchesAgent = agentToolUseId != null && parentIds.includes(agentToolUseId);
+
+    console.error('\n══════ T1-T3 实测值（嵌套 subagent id）══════');
+    console.error(`[顶层] Agent tool_use block.id = ${agentToolUseId}`);
+    console.error(`[T1] subagent 内部 assistant 数=${subagentAssistants.length}；其 parent_tool_use_id 取值=${JSON.stringify(parentIds)}`);
+    console.error(`[T1] parent_tool_use_id === Agent block.id ? ${parentMatchesAgent}`);
+    console.error(`[T1] subagent 内部是否调了 Bash: ${subagentBashCalls.length > 0}（${JSON.stringify(subagentBashCalls)}）`);
+    console.error(`[T2] subagent assistant.subagent_type 取值=${JSON.stringify([...new Set(subagentAssistants.map(a => a.subagent_type))])}`);
+    console.error(`[T3] task_started.subagent_type 取值=${JSON.stringify(taskStartedSnaps.map(t => ({ task_type: t.task_type, subagent_type: t.subagent_type })))}`);
+    console.error(`[补充] task_started tool_use_id 是否 == Agent block.id: ${taskStartedSnaps.map(t => t.tool_use_id === agentToolUseId)}`);
+
+    writeFileSync(`${dir}/sdk-events.json`, JSON.stringify(events, null, 2));
+    writeFileSync(`${dir}/nested-subagent-id.json`, JSON.stringify({
+      agentToolUseId,
+      assistantSnaps,
+      subagentAssistantCount: subagentAssistants.length,
+      parentIds,
+      parentMatchesAgent,
+      subagentBashCalls,
+      taskStartedSnaps,
+      duration,
+    }, null, 2));
+
+    expect(events.length).toBeGreaterThan(0);
+    // 否定发现记录：本地 LLM 可能不真正启动 subagent，或 subagent 不调 Bash
+    if (subagentAssistants.length === 0) {
+      console.error('[否定发现] 未观测到 parent_tool_use_id 非 null 的 assistant —— 本地 LLM 可能未真正走 subagent（Agent 工具未展开子消息）');
+    }
+  }, 120000);
+});
+
+// ====== 自动后台化后如何解除阻塞、边聊边执行（case-25，最核心）======
+//
+// streaming-input 模式，msg1 让 LLM 跑长前台 bash（run_in_background:false，
+// sleep 40 && echo bg-25-done，触发自动后台化 → 阻塞）。依次尝试三种解除阻塞手段：
+//   路径1：等 task_started 后调 backgroundTasks(taskStarted.tool_use_id)——case-17
+//          说 task_started 后调能成功，但那是 run_in_background:false 长命令由 LLM
+//          明确前台。本 case 实测自动后台化场景下返回 true 还是 false。
+//   路径2：若 backgroundTasks 无效，turn 活跃时同步 interrupt()。
+//   路径3：记录哪条路径成功解阻塞（query 未等满 sleep 40 就续轮问 msg2"任务好了吗"）。
+//
+// 产出"三路径对照结论"：自动后台化的阻塞，到底靠什么能解除、能否边聊边等后台 bash 完成。
+//
+// 实现策略：优先试路径1（backgroundTasks）。若返回 true → 记为路径1成功，放行 msg2。
+// 若返回 false/非 true → 立即在主循环同步 interrupt（贴近 turn 活跃窗口）。
+
+describe('自动后台化解除阻塞三路径', () => {
+  const LONG_CMD_25 = 'sleep 40 && echo bg-25-done';
+
+  it('case-25 自动后台化: backgroundTasks vs interrupt 哪条能解阻塞边聊', async () => {
+    const dir = createTimestampDir('tool-foreground-background/case-25-unblock-three-paths');
+
+    const state = {
+      queryStartedAt: Date.now(),
+      bashToolUseId: null as string | null,        // assistant block.id
+      taskStartedToolUseId: null as string | null, // task_started.tool_use_id
+      bashTaskId: null as string | null,
+      taskStartedAt: null as number | null,
+      // 路径1
+      bgCallResult: 'NOT_CALLED' as boolean | 'NOT_CALLED' | 'NO_METHOD' | string,
+      bgCallAt: null as number | null,
+      backgroundTaskIdFromResult: null as string | null,
+      // 路径2
+      interruptCallResult: 'NOT_CALLED' as 'NOT_CALLED' | 'OK' | 'NO_METHOD' | string,
+      interruptCallAt: null as number | null,
+      // 结果
+      unblockPath: null as string | null,          // 'backgroundTasks' | 'interrupt' | 'none'
+      firstTurnEndedAt: null as number | null,      // 第一轮 turn 何时结束（解阻塞判据）
+      turnsObserved: 0,
+      turn2Reached: false,
+      taskNotificationStatus: null as string | null,
+      taskNotificationAt: null as number | null,
+      queryEnded: false,
+      queryEndedAt: null as number | null,
+      resultSubtype: null as string | null,
+      terminalReason: null as string | null,
+    };
+
+    const events: CapturedSDKEvent[] = [];
+    const observerLog: any[] = [];
+
+    let resolveTurn2: () => void = () => {};
+    const turn2Gate = new Promise<void>((r) => { resolveTurn2 = r; });
+    // 安全阀 25s：万一两条路径都没解阻塞，也别挂死到 sleep 40
+    const turn2Timeout = new Promise<void>((r) => setTimeout(r, 25000));
+
+    const msg1: any = {
+      type: 'user',
+      message: { role: 'user', content: `Use the Bash tool to run this exact command: ${LONG_CMD_25}. Run it in the foreground. Do NOT set run_in_background.` },
+      parent_tool_use_id: null,
+    };
+    const msg2: any = {
+      type: 'user',
+      message: { role: 'user', content: 'Is the task you started ready yet? Just report its status in one sentence. Do NOT run any new commands.' },
+      parent_tool_use_id: null,
+      priority: 'now',
+    };
+
+    async function* promptInput(): AsyncIterable<any> {
+      yield msg1;
+      await Promise.race([turn2Gate, turn2Timeout]);
+      state.turn2Reached = true;
+      console.error(`\n[gen] turn2 放行 @ ${Date.now() - state.queryStartedAt}ms，yield msg2`);
+      yield msg2;
+    }
+
+    const env = { ...BASE_ENV, OTEL_LOG_RAW_API_BODIES: `file:${dir}` };
+    const queryOptions: any = {
+      env, includePartialMessages: true, persistSession: false,
+      settingSources: [], effort: 'low', permissionMode: 'bypassPermissions',
+    };
+
+    const sdkQuery = query({ prompt: promptInput(), options: queryOptions });
+    const queryHandle: any = sdkQuery;
+
+    const observer = setInterval(() => {
+      const t = Date.now() - state.queryStartedAt;
+      observerLog.push({
+        t, taskStarted: state.bashTaskId != null, bgCall: state.bgCallResult,
+        interrupt: state.interruptCallResult, unblockPath: state.unblockPath,
+        firstTurnEnded: state.firstTurnEndedAt != null, queryEnded: state.queryEnded,
+        turns: state.turnsObserved,
+      });
+      console.error(`[obs t=${t}ms] taskStarted=${state.bashTaskId != null} bgCall=${state.bgCallResult} intr=${state.interruptCallResult} path=${state.unblockPath ?? '-'} 1stTurnEnded=${state.firstTurnEndedAt != null} ended=${state.queryEnded}`);
+    }, 1000);
+
+    let index = 0;
+    let firstResultSeen = false;
+    try {
+      for await (const message of sdkQuery) {
+        const msg = message as any;
+        const type = msg.type || 'unknown';
+        const rel = Date.now() - state.queryStartedAt;
+        const captured: CapturedSDKEvent = { index: index++, type, timestamp: Date.now() };
+
+        if (type === 'stream_event' && msg.event) {
+          captured.eventType = msg.event.type;
+          if (msg.event.type === 'content_block_delta' && msg.event.delta?.type === 'text_delta') {
+            process.stderr.write(msg.event.delta.text);
+          }
+        }
+
+        if (type === 'system') {
+          captured.subtype = msg.subtype;
+          if (msg.subtype === 'task_started') {
+            captured.taskId = msg.task_id;
+            captured.raw = { ...msg };
+            if (!state.bashTaskId) {
+              state.bashTaskId = msg.task_id;
+              state.taskStartedToolUseId = msg.tool_use_id ?? null;
+              state.taskStartedAt = rel;
+              console.error(`\n[${rel}ms] task_started task_id=${msg.task_id} tool_use_id=${msg.tool_use_id} task_type=${msg.task_type}`);
+            }
+          }
+          if (msg.subtype === 'task_updated') {
+            captured.taskId = msg.task_id;
+            captured.raw = { patch: msg.patch };
+            console.error(`\n[${rel}ms] task_updated patch=${JSON.stringify(msg.patch)}`);
+          }
+          if (msg.subtype === 'task_notification') {
+            captured.taskId = msg.task_id;
+            captured.taskStatus = msg.status;
+            captured.raw = { status: msg.status, output_file: msg.output_file };
+            state.taskNotificationStatus = msg.status;
+            state.taskNotificationAt = rel;
+            console.error(`\n[${rel}ms] task_notification status=${msg.status} output_file="${msg.output_file}"`);
+            resolveTurn2();
+          }
+        }
+
+        if (type === 'assistant' && msg.message?.content) {
+          state.turnsObserved++;
+          for (const block of msg.message.content) {
+            if (block.type === 'tool_use' && block.name === 'Bash' && !state.bashToolUseId) {
+              state.bashToolUseId = block.id;
+              console.error(`\n[${rel}ms] assistant Bash block.id=${block.id}`);
+              if (!captured.raw) captured.raw = {};
+              captured.raw.toolInput = block.input;
+            }
+          }
+        }
+
+        if (type === 'user') {
+          const cb = Array.isArray(msg.message?.content) ? msg.message.content : [];
+          for (const b of cb) {
+            if (b.type === 'tool_result') {
+              const snippet = typeof b.content === 'string' ? b.content
+                : Array.isArray(b.content) ? b.content.map((c: any) => (c.type === 'text' ? c.text : '')).join('') : '';
+              captured.raw = { tool_use_id: b.tool_use_id, contentSnippet: snippet.substring(0, 500) };
+              const m = snippet.match(/backgroundTaskId["']?\s*[:=]\s*["']?([A-Za-z0-9_-]+)/i) || snippet.match(/ID:\s*([A-Za-z0-9_-]+)/i);
+              if (m && !state.backgroundTaskIdFromResult) state.backgroundTaskIdFromResult = m[1];
+            }
+          }
+        }
+
+        if (type === 'result') {
+          captured.raw = { subtype: msg.subtype, num_turns: msg.num_turns, terminal_reason: msg.terminal_reason };
+          // 第一轮 result = 第一轮 turn 结束（解阻塞判据）
+          if (!firstResultSeen) {
+            firstResultSeen = true;
+            state.firstTurnEndedAt = rel;
+            console.error(`\n[${rel}ms] 第一轮 result subtype=${msg.subtype}（第一轮 turn 结束 → 解阻塞）`);
+          }
+          state.queryEnded = true;
+          state.queryEndedAt = rel;
+          state.resultSubtype = msg.subtype;
+          state.terminalReason = msg.terminal_reason ?? null;
+          console.error(`\n[${rel}ms] result subtype=${msg.subtype} num_turns=${msg.num_turns} terminal_reason=${msg.terminal_reason ?? '-'}`);
+          resolveTurn2();
+        }
+
+        events.push(captured);
+
+        // ── 路径1：等 task_started 后调 backgroundTasks（自动后台化场景实测）──
+        if (state.bashTaskId && state.bgCallResult === 'NOT_CALLED') {
+          const idToUse = state.taskStartedToolUseId || state.bashToolUseId;
+          state.bgCallAt = rel;
+          console.error(`\n[路径1 backgroundTasks] 等到 task_started 后调用 @ ${rel}ms，用 id=${idToUse}`);
+          try {
+            state.bgCallResult = typeof queryHandle.backgroundTasks === 'function'
+              ? await queryHandle.backgroundTasks(idToUse)
+              : 'NO_METHOD';
+          } catch (e: any) {
+            state.bgCallResult = `ERROR: ${e?.message || e}`;
+          }
+          console.error(`[路径1 backgroundTasks] 返回: ${state.bgCallResult}`);
+          if (state.bgCallResult === true) {
+            state.unblockPath = 'backgroundTasks';
+            console.error(`[路径1] backgroundTasks 成功解阻塞`);
+            resolveTurn2();
+          } else {
+            // ── 路径2：backgroundTasks 无效 → turn 仍活跃 → 同步 interrupt 兜底 ──
+            state.interruptCallAt = Date.now() - state.queryStartedAt;
+            console.error(`\n[路径2 interrupt] backgroundTasks 返回非 true，turn 仍活跃时同步 interrupt @ ${state.interruptCallAt}ms`);
+            try {
+              if (typeof queryHandle.interrupt === 'function') {
+                await queryHandle.interrupt();
+                state.interruptCallResult = 'OK';
+              } else {
+                state.interruptCallResult = 'NO_METHOD';
+              }
+            } catch (e: any) {
+              state.interruptCallResult = `ERROR: ${e?.message || e}`;
+            }
+            console.error(`[路径2 interrupt] 结果: ${state.interruptCallResult}`);
+            if (state.interruptCallResult === 'OK') {
+              state.unblockPath = 'interrupt';
+              console.error(`[路径2] interrupt 调用成功（是否真解阻塞看 firstTurnEndedAt 时机）`);
+            }
+            resolveTurn2();
+          }
+        }
+      }
+    } finally {
+      clearInterval(observer);
+    }
+
+    const duration = Date.now() - state.queryStartedAt;
+    if (!state.queryEnded) state.queryEndedAt = duration;
+    if (state.unblockPath == null) state.unblockPath = 'none';
+
+    // 解阻塞判据：第一轮 turn 是否在 sleep 40 完成前结束
+    const unblockedBeforeSleepDone = state.firstTurnEndedAt != null && state.firstTurnEndedAt < 40000;
+
+    printTimeline('Case 25: 自动后台化解除阻塞三路径', events, duration);
+
+    console.error('\n══════ 三路径对照结论（case-25）══════');
+    console.error(`[路径1] backgroundTasks(自动后台化任务) 返回: ${state.bgCallResult}（@${state.bgCallAt}ms，task_started@${state.taskStartedAt}ms）`);
+    console.error(`        tool_result.backgroundTaskId=${state.backgroundTaskIdFromResult}`);
+    console.error(`[路径2] interrupt 结果: ${state.interruptCallResult}（@${state.interruptCallAt}ms）`);
+    console.error(`[路径3] 实际解阻塞路径 = ${state.unblockPath}`);
+    console.error(`        第一轮 turn 结束@${state.firstTurnEndedAt}ms（<40000 表示未等满 sleep 40 → 解阻塞成功=${unblockedBeforeSleepDone}）`);
+    console.error(`        续轮到达=${state.turn2Reached}，turnsObserved=${state.turnsObserved}`);
+    console.error(`        task_notification status=${state.taskNotificationStatus}@${state.taskNotificationAt}ms`);
+    console.error(`        result.subtype=${state.resultSubtype}，terminal_reason=${state.terminalReason}，总耗时=${duration}ms`);
+
+    writeFileSync(`${dir}/sdk-events.json`, JSON.stringify(events, null, 2));
+    writeFileSync(`${dir}/observer-log.json`, JSON.stringify(observerLog, null, 2));
+    writeFileSync(`${dir}/unblock-three-paths.json`, JSON.stringify({
+      bgCallResult: state.bgCallResult, bgCallAt: state.bgCallAt,
+      backgroundTaskIdFromResult: state.backgroundTaskIdFromResult,
+      interruptCallResult: state.interruptCallResult, interruptCallAt: state.interruptCallAt,
+      unblockPath: state.unblockPath, firstTurnEndedAt: state.firstTurnEndedAt,
+      unblockedBeforeSleepDone, turn2Reached: state.turn2Reached, turnsObserved: state.turnsObserved,
+      taskStartedAt: state.taskStartedAt, taskStartedToolUseId: state.taskStartedToolUseId,
+      bashToolUseId: state.bashToolUseId, bashTaskId: state.bashTaskId,
+      taskNotificationStatus: state.taskNotificationStatus, taskNotificationAt: state.taskNotificationAt,
+      resultSubtype: state.resultSubtype, terminalReason: state.terminalReason,
+      queryEndedAt: state.queryEndedAt, duration,
+    }, null, 2));
+
+    // ── 断言 ──
+    expect(events.length).toBeGreaterThan(0);
+    // 至少调过 backgroundTasks（路径1一定会走）
+    expect(state.bgCallResult).not.toBe('NOT_CALLED');
+    expect(state.bgCallResult).not.toBe('NO_METHOD');
+  }, 180000);
+});
+
+// ====== 终止显式后台 bash（case-26）======
+//
+// case-15 测过 stopTask 停"手动转后台"（LLM run_in_background:false 后被自动/手动后台化）
+// 的任务。本 case 专门验证【显式后台 bash（run_in_background:true）】能否被 stopTask 终止：
+// 起一个 sleep 40 的后台 bash，等 task_started 后 stopTask(taskId)，观察：
+//   M1 stopTask 是否成功（不抛错）？
+//   M2 task_notification 是否变 stopped？
+//   M3 task_updated 是否报 killed（对照 case-21 手动转后台的 killed）？
+//   M4 后台进程是否真被杀（sleep 40 未跑完，总耗时远小于 40s）？
+// 与 case-15 对照（case-15 停的是 run_in_background:false 被转后台的任务）。
+
+describe('终止显式后台 bash', () => {
+  const BG_CMD_26 = 'sleep 40 && echo bg-26-done';
+
+  it('case-26 stopTask 终止 run_in_background:true 的显式后台 bash', async () => {
+    const dir = createTimestampDir('tool-foreground-background/case-26-stop-explicit-bg');
+
+    const state = {
+      queryStartedAt: Date.now(),
+      bashTaskId: null as string | null,
+      taskStartedAt: null as number | null,
+      taskType: null as string | null,
+      backgroundTaskIdFromResult: null as string | null,
+      stopCallResult: 'NOT_CALLED' as 'NOT_CALLED' | 'OK' | 'NO_METHOD' | string,
+      stopCallAt: null as number | null,
+      taskUpdatedStatuses: [] as { relMs: number; status: string | undefined; patchKeys: string[] }[],
+      sawKilled: false,
+      taskNotificationStatus: null as string | null,
+      taskNotificationAt: null as number | null,
+      queryEnded: false,
+      queryEndedAt: null as number | null,
+      resultSubtype: null as string | null,
+      turnsObserved: 0,
+      turn2Reached: false,
+    };
+
+    const events: CapturedSDKEvent[] = [];
+    const observerLog: any[] = [];
+
+    let resolveTurn2: () => void = () => {};
+    const turn2Gate = new Promise<void>((r) => { resolveTurn2 = r; });
+    const turn2Timeout = new Promise<void>((r) => setTimeout(r, 20000));
+
+    const msg1: any = {
+      type: 'user',
+      message: { role: 'user', content: `Use the Bash tool to run this exact command in the BACKGROUND (set run_in_background to true): ${BG_CMD_26}. Then tell me the background task id.` },
+      parent_tool_use_id: null,
+    };
+    const msg2: any = {
+      type: 'user',
+      message: { role: 'user', content: 'Was the background task stopped or did it complete? Report its final status. Do NOT run any new commands.' },
+      parent_tool_use_id: null,
+      priority: 'now',
+    };
+
+    async function* promptInput(): AsyncIterable<any> {
+      yield msg1;
+      await Promise.race([turn2Gate, turn2Timeout]);
+      state.turn2Reached = true;
+      console.error(`\n[gen] turn2 放行 @ ${Date.now() - state.queryStartedAt}ms`);
+      yield msg2;
+    }
+
+    const env = { ...BASE_ENV, OTEL_LOG_RAW_API_BODIES: `file:${dir}` };
+    const queryOptions: any = {
+      env, includePartialMessages: true, persistSession: false,
+      settingSources: [], effort: 'low', permissionMode: 'bypassPermissions',
+    };
+
+    const sdkQuery = query({ prompt: promptInput(), options: queryOptions });
+    const queryHandle: any = sdkQuery;
+
+    const observer = setInterval(() => {
+      const t = Date.now() - state.queryStartedAt;
+      observerLog.push({
+        t, taskId: state.bashTaskId, stop: state.stopCallResult,
+        sawKilled: state.sawKilled, notif: state.taskNotificationStatus, ended: state.queryEnded,
+      });
+      console.error(`[obs t=${t}ms] taskId=${state.bashTaskId ?? '-'} stop=${state.stopCallResult} killed=${state.sawKilled} notif=${state.taskNotificationStatus ?? '-'} ended=${state.queryEnded}`);
+    }, 1000);
+
+    let index = 0;
+    try {
+      for await (const message of sdkQuery) {
+        const msg = message as any;
+        const type = msg.type || 'unknown';
+        const rel = Date.now() - state.queryStartedAt;
+        const captured: CapturedSDKEvent = { index: index++, type, timestamp: Date.now() };
+
+        if (type === 'stream_event' && msg.event) {
+          captured.eventType = msg.event.type;
+          if (msg.event.type === 'content_block_delta' && msg.event.delta?.type === 'text_delta') {
+            process.stderr.write(msg.event.delta.text);
+          }
+        }
+
+        if (type === 'system') {
+          captured.subtype = msg.subtype;
+          if (msg.subtype === 'task_started' && !state.bashTaskId) {
+            state.bashTaskId = msg.task_id;
+            state.taskStartedAt = rel;
+            state.taskType = msg.task_type ?? null;
+            captured.taskId = msg.task_id;
+            captured.raw = { ...msg };
+            console.error(`\n[${rel}ms] task_started task_id=${msg.task_id} task_type=${msg.task_type}`);
+          }
+          if (msg.subtype === 'task_updated') {
+            const p = msg.patch || {};
+            state.taskUpdatedStatuses.push({ relMs: rel, status: p.status, patchKeys: Object.keys(p) });
+            if (p.status === 'killed') state.sawKilled = true;
+            captured.taskId = msg.task_id;
+            captured.raw = { patch: p };
+            console.error(`\n[${rel}ms] ⚡ task_updated patch=${JSON.stringify(p)}`);
+          }
+          if (msg.subtype === 'task_notification') {
+            captured.taskId = msg.task_id;
+            captured.taskStatus = msg.status;
+            captured.raw = { status: msg.status, output_file: msg.output_file };
+            state.taskNotificationStatus = msg.status;
+            state.taskNotificationAt = rel;
+            console.error(`\n[${rel}ms] task_notification status=${msg.status} output_file="${msg.output_file}"`);
+            resolveTurn2();
+          }
+        }
+
+        if (type === 'user') {
+          const cb = Array.isArray(msg.message?.content) ? msg.message.content : [];
+          for (const b of cb) {
+            if (b.type === 'tool_result') {
+              const snippet = typeof b.content === 'string' ? b.content
+                : Array.isArray(b.content) ? b.content.map((c: any) => (c.type === 'text' ? c.text : '')).join('') : '';
+              captured.raw = { tool_use_id: b.tool_use_id, contentSnippet: snippet.substring(0, 500) };
+              const m = snippet.match(/backgroundTaskId["']?\s*[:=]\s*["']?([A-Za-z0-9_-]+)/i) || snippet.match(/ID:\s*([A-Za-z0-9_-]+)/i);
+              if (m && !state.backgroundTaskIdFromResult) state.backgroundTaskIdFromResult = m[1];
+            }
+          }
+        }
+
+        if (type === 'assistant' && msg.message?.content) {
+          state.turnsObserved++;
+          for (const block of msg.message.content) {
+            if (block.type === 'tool_use') { captured.toolName = block.name; captured.toolUseId = block.id; }
+          }
+        }
+
+        if (type === 'result') {
+          captured.raw = { subtype: msg.subtype, num_turns: msg.num_turns, terminal_reason: msg.terminal_reason };
+          state.queryEnded = true;
+          state.queryEndedAt = rel;
+          state.resultSubtype = msg.subtype;
+          console.error(`\n[${rel}ms] result subtype=${msg.subtype} num_turns=${msg.num_turns}`);
+          resolveTurn2();
+        }
+
+        events.push(captured);
+
+        // ── 等 task_started 后 stopTask（显式后台任务）──
+        if (state.bashTaskId && state.stopCallResult === 'NOT_CALLED') {
+          state.stopCallAt = rel;
+          console.error(`\n[stopTask] 等到 task_started 后调用 @ ${rel}ms，taskId=${state.bashTaskId}`);
+          try {
+            if (typeof queryHandle.stopTask === 'function') {
+              await queryHandle.stopTask(state.bashTaskId);
+              state.stopCallResult = 'OK';
+            } else {
+              state.stopCallResult = 'NO_METHOD';
+            }
+          } catch (e: any) {
+            state.stopCallResult = `ERROR: ${e?.message || e}`;
+          }
+          console.error(`[stopTask] 结果: ${state.stopCallResult}`);
+        }
+      }
+    } finally {
+      clearInterval(observer);
+    }
+
+    const duration = Date.now() - state.queryStartedAt;
+    if (!state.queryEnded) state.queryEndedAt = duration;
+
+    const killedInterrupted = duration < 40000; // sleep 40 若被杀，总耗时应远小于 40s
+
+    printTimeline('Case 26: 终止显式后台 bash', events, duration);
+
+    console.error('\n══════ M1-M4 实测值（终止显式后台 bash）══════');
+    console.error(`[M1] stopTask 结果: ${state.stopCallResult}（@${state.stopCallAt}ms，task_started@${state.taskStartedAt}ms，task_type=${state.taskType}）`);
+    console.error(`[M1] tool_result.backgroundTaskId=${state.backgroundTaskIdFromResult}（显式后台应有值，对照 case-2）`);
+    console.error(`[M2] task_notification status=${state.taskNotificationStatus}@${state.taskNotificationAt}ms（期望 stopped）`);
+    console.error(`[M3] task_updated 序列: ${JSON.stringify(state.taskUpdatedStatuses)}；是否报 killed=${state.sawKilled}`);
+    console.error(`[M4] sleep 40 是否被中断: 总耗时=${duration}ms（<40000 表示进程真被杀=${killedInterrupted}）`);
+    console.error(`[对照 case-15] case-15 停 run_in_background:false 转后台任务；本 case 停 run_in_background:true 显式后台任务`);
+    console.error(`[补充] turn2Reached=${state.turn2Reached}，turnsObserved=${state.turnsObserved}，result.subtype=${state.resultSubtype}`);
+
+    writeFileSync(`${dir}/sdk-events.json`, JSON.stringify(events, null, 2));
+    writeFileSync(`${dir}/observer-log.json`, JSON.stringify(observerLog, null, 2));
+    writeFileSync(`${dir}/stop-explicit-bg.json`, JSON.stringify({
+      stopCallResult: state.stopCallResult, stopCallAt: state.stopCallAt,
+      taskStartedAt: state.taskStartedAt, taskType: state.taskType, bashTaskId: state.bashTaskId,
+      backgroundTaskIdFromResult: state.backgroundTaskIdFromResult,
+      taskUpdatedStatuses: state.taskUpdatedStatuses, sawKilled: state.sawKilled,
+      taskNotificationStatus: state.taskNotificationStatus, taskNotificationAt: state.taskNotificationAt,
+      killedInterrupted, turn2Reached: state.turn2Reached, turnsObserved: state.turnsObserved,
+      resultSubtype: state.resultSubtype, queryEndedAt: state.queryEndedAt, duration,
+    }, null, 2));
+
+    // ── 断言 ──
+    expect(events.length).toBeGreaterThan(0);
+    expect(state.stopCallResult).not.toBe('NOT_CALLED');
+    expect(state.stopCallResult).not.toBe('NO_METHOD');
+    // 软断言：记录，不 fatal
+    try {
+      expect(state.taskNotificationStatus).toBe('stopped');
+    } catch {
+      console.error(`[软断言] task_notification status=${state.taskNotificationStatus}（非 stopped）—— 记录实测`);
+    }
+  }, 180000);
+});
+
+// ====== close() 生命周期（case-27）======
+//
+// 验证 query 运行期间有后台 bash 在跑时调用 close() 会怎样。
+// 用 streaming-input 起一个长后台 bash（run_in_background:true，确保真后台不阻塞），
+// 等 task_started 后调 queryHandle.close()，观察：
+//   C1 close 后是否还收到 task_notification？
+//   C2 query 迭代器是否立即终止（for-await 是否马上退出）？
+//   C3 result 消息还来不来？
+//   C4 close 后后台进程是否变孤儿（sleep 40 是否仍在跑 → 用 .output 文件推断）？
+// 这决定 CodePilot 关闭会话时后台任务是否变孤儿。
+//
+// 注意：close() 是同步方法（返回 void）。调用后 for-await 应结束。
+// 用 flag 标记 close 调用时刻，之后到达的任何消息都记为"close 后仍收到"。
+
+describe('close() 生命周期', () => {
+  const BG_CMD_27 = 'sleep 40 && echo bg-27-done';
+
+  it('case-27 运行期有后台 bash 时 close() 的行为', async () => {
+    const dir = createTimestampDir('tool-foreground-background/case-27-close-lifecycle');
+
+    const state = {
+      queryStartedAt: Date.now(),
+      bashTaskId: null as string | null,
+      taskStartedAt: null as number | null,
+      backgroundTaskIdFromResult: null as string | null,
+      outputFile: null as string | null,
+      closeCalledAt: null as number | null,
+      closeError: null as string | null,
+      messagesAfterClose: [] as { relMs: number; type: string; subtype?: string }[],
+      taskNotificationAfterClose: false,
+      resultAfterClose: false,
+      resultSubtype: null as string | null,
+      iteratorEndedAt: null as number | null,
+      queryEnded: false,
+    };
+
+    const events: CapturedSDKEvent[] = [];
+
+    // 单条 prompt 即可（不需要续轮）；用 generator 保持 streaming 模式（控制方法需要）
+    const msg1: any = {
+      type: 'user',
+      message: { role: 'user', content: `Use the Bash tool to run this exact command in the BACKGROUND (set run_in_background to true): ${BG_CMD_27}. Then tell me the background task id.` },
+      parent_tool_use_id: null,
+    };
+    // 永不 resolve 的 gate：让 generator 挂住不结束输入流，直到我们 close
+    async function* promptInput(): AsyncIterable<any> {
+      yield msg1;
+      await new Promise<void>(() => {}); // 挂住
+    }
+
+    const env = { ...BASE_ENV, OTEL_LOG_RAW_API_BODIES: `file:${dir}` };
+    const queryOptions: any = {
+      env, includePartialMessages: true, persistSession: false,
+      settingSources: [], effort: 'low', permissionMode: 'bypassPermissions',
+    };
+
+    const sdkQuery = query({ prompt: promptInput(), options: queryOptions });
+    const queryHandle: any = sdkQuery;
+
+    // 每秒读 .output 判断后台进程是否还活（close 后是否变孤儿仍写文件）
+    const fileSnapshots: any[] = [];
+    const poller = setInterval(() => {
+      const t = Date.now() - state.queryStartedAt;
+      let exists = false, size = 0;
+      if (state.outputFile) {
+        exists = existsSync(state.outputFile);
+        if (exists) { try { size = readFileSync(state.outputFile, 'utf-8').length; } catch {} }
+      }
+      fileSnapshots.push({ t, closeCalledAt: state.closeCalledAt, outputFile: state.outputFile, exists, size });
+      console.error(`[poll t=${t}ms] closeCalled=${state.closeCalledAt != null} outputFile=${state.outputFile ? '有' : '无'} exists=${exists} size=${size}`);
+    }, 1000);
+
+    let index = 0;
+    try {
+      for await (const message of sdkQuery) {
+        const msg = message as any;
+        const type = msg.type || 'unknown';
+        const rel = Date.now() - state.queryStartedAt;
+        const captured: CapturedSDKEvent = { index: index++, type, timestamp: Date.now() };
+
+        // close 之后到达的消息记录下来
+        if (state.closeCalledAt != null) {
+          state.messagesAfterClose.push({ relMs: rel, type, subtype: msg.subtype });
+          console.error(`\n[${rel}ms] ⚠️ close 后仍收到消息: type=${type} subtype=${msg.subtype ?? '-'}`);
+          if (type === 'system' && msg.subtype === 'task_notification') state.taskNotificationAfterClose = true;
+          if (type === 'result') state.resultAfterClose = true;
+        }
+
+        if (type === 'stream_event' && msg.event) {
+          captured.eventType = msg.event.type;
+          if (msg.event.type === 'content_block_delta' && msg.event.delta?.type === 'text_delta') {
+            process.stderr.write(msg.event.delta.text);
+          }
+        }
+
+        if (type === 'system') {
+          captured.subtype = msg.subtype;
+          if (msg.subtype === 'task_started' && !state.bashTaskId) {
+            state.bashTaskId = msg.task_id;
+            state.taskStartedAt = rel;
+            captured.taskId = msg.task_id;
+            captured.raw = { ...msg };
+            console.error(`\n[${rel}ms] task_started task_id=${msg.task_id} task_type=${msg.task_type}`);
+          }
+          if (msg.subtype === 'task_notification') {
+            captured.taskId = msg.task_id;
+            captured.taskStatus = msg.status;
+            if (msg.output_file && !state.outputFile) state.outputFile = msg.output_file;
+            console.error(`\n[${rel}ms] task_notification status=${msg.status} output_file="${msg.output_file}"`);
+          }
+        }
+
+        if (type === 'user') {
+          const cb = Array.isArray(msg.message?.content) ? msg.message.content : [];
+          for (const b of cb) {
+            if (b.type === 'tool_result') {
+              const snippet = typeof b.content === 'string' ? b.content
+                : Array.isArray(b.content) ? b.content.map((c: any) => (c.type === 'text' ? c.text : '')).join('') : '';
+              const m = snippet.match(/backgroundTaskId["']?\s*[:=]\s*["']?([A-Za-z0-9_-]+)/i) || snippet.match(/ID:\s*([A-Za-z0-9_-]+)/i);
+              if (m && !state.backgroundTaskIdFromResult) state.backgroundTaskIdFromResult = m[1];
+              const fm = snippet.match(/written to:\s*([^\s"]+\.output)/i) || snippet.match(/([A-Za-z]:\\[^\s"]+\.output)/);
+              if (fm && !state.outputFile) state.outputFile = fm[1];
+            }
+          }
+        }
+
+        if (type === 'result') {
+          captured.raw = { subtype: msg.subtype, num_turns: msg.num_turns };
+          state.resultSubtype = msg.subtype;
+          console.error(`\n[${rel}ms] result subtype=${msg.subtype}`);
+        }
+
+        events.push(captured);
+
+        // ── 等 task_started 后调 close() ──
+        if (state.bashTaskId && state.closeCalledAt == null) {
+          state.closeCalledAt = rel;
+          console.error(`\n[close] 等到 task_started 后调用 close() @ ${rel}ms（后台任务 ${state.bashTaskId} 正在跑）`);
+          try {
+            if (typeof queryHandle.close === 'function') {
+              queryHandle.close();
+            } else {
+              state.closeError = 'NO_METHOD';
+            }
+          } catch (e: any) {
+            state.closeError = `ERROR: ${e?.message || e}`;
+          }
+          console.error(`[close] 调用完成${state.closeError ? '，错误: ' + state.closeError : '（同步返回）'}`);
+        }
+      }
+      state.iteratorEndedAt = Date.now() - state.queryStartedAt;
+      state.queryEnded = true;
+      console.error(`\n[iterator] for-await 正常结束 @ ${state.iteratorEndedAt}ms`);
+    } catch (e: any) {
+      state.iteratorEndedAt = Date.now() - state.queryStartedAt;
+      console.error(`\n[iterator] for-await 抛出 @ ${state.iteratorEndedAt}ms: ${e?.message || e}`);
+    } finally {
+      clearInterval(poller);
+    }
+
+    const duration = Date.now() - state.queryStartedAt;
+    const iteratorEndedFastAfterClose = state.closeCalledAt != null && state.iteratorEndedAt != null
+      && (state.iteratorEndedAt - state.closeCalledAt) < 5000;
+
+    printTimeline('Case 27: close() 生命周期', events, duration);
+
+    console.error('\n══════ C1-C4 实测值（close 生命周期）══════');
+    console.error(`[close] 调用@${state.closeCalledAt}ms（task_started@${state.taskStartedAt}ms）；错误=${state.closeError ?? '无'}`);
+    console.error(`[C1] close 后是否还收到 task_notification: ${state.taskNotificationAfterClose}`);
+    console.error(`[C2] 迭代器结束@${state.iteratorEndedAt}ms；close 后 ${state.iteratorEndedAt != null && state.closeCalledAt != null ? state.iteratorEndedAt - state.closeCalledAt : '?'}ms 内结束（<5000=立即终止=${iteratorEndedFastAfterClose}）`);
+    console.error(`[C2] close 后共收到 ${state.messagesAfterClose.length} 条消息: ${JSON.stringify(state.messagesAfterClose)}`);
+    console.error(`[C3] close 后是否还来 result: ${state.resultAfterClose}（result.subtype=${state.resultSubtype ?? '未收到'}）`);
+    console.error(`[C4] 后台进程孤儿判断: outputFile=${state.outputFile ?? '无'}；文件快照见 json（close 后仍增长=可能孤儿）`);
+    console.error(`[总耗时] ${duration}ms（若 <40000 且迭代器已结束，说明没等 sleep 40）`);
+
+    writeFileSync(`${dir}/sdk-events.json`, JSON.stringify(events, null, 2));
+    writeFileSync(`${dir}/close-lifecycle.json`, JSON.stringify({
+      closeCalledAt: state.closeCalledAt, closeError: state.closeError,
+      taskStartedAt: state.taskStartedAt, bashTaskId: state.bashTaskId,
+      backgroundTaskIdFromResult: state.backgroundTaskIdFromResult, outputFile: state.outputFile,
+      iteratorEndedAt: state.iteratorEndedAt, iteratorEndedFastAfterClose,
+      messagesAfterClose: state.messagesAfterClose,
+      taskNotificationAfterClose: state.taskNotificationAfterClose,
+      resultAfterClose: state.resultAfterClose, resultSubtype: state.resultSubtype,
+      fileSnapshots, duration,
+    }, null, 2));
+
+    // ── 断言 ──
+    expect(events.length).toBeGreaterThan(0);
+    // close 方法存在且被调用
+    expect(state.closeCalledAt).not.toBeNull();
+    expect(state.closeError).toBeNull();
+    // 迭代器最终应结束（不挂死）
+    expect(state.iteratorEndedAt).not.toBeNull();
+  }, 120000);
+});
+
+// ====== 尝试触发 paused 状态（case-28，探索性）======
+//
+// case-21 只跑出了 task_updated.patch.status=killed，从未触发过 paused
+// （sdk.d.ts:4249 六态之一：pending|running|completed|failed|killed|paused）。
+// 尝试各种手段触发 paused：起后台任务后调 backgroundTasks 再 stopTask、或 close、
+// 或 interrupt 组合，看能否让 task_updated 报 paused。
+//
+// 探索性实验：触发不到就如实记为否定发现 + 原因推断（可能 paused 仅 TUI 暂停/
+// 特定 workflow 场景，SDK query 层无触发路径）。
+//
+// 策略：起显式后台 bash（sleep 40）→ 等 task_started → 依次尝试组合动作，
+// 全程收集所有 task_updated.patch.status，看是否出现 paused。
+// 组合序列（每步间隔观察）：backgroundTasks(taskId) → interrupt() → stopTask(taskId)。
+
+describe('尝试触发 paused 状态', () => {
+  const BG_CMD_28 = 'sleep 40 && echo bg-28-done';
+
+  it('case-28 组合控制方法尝试触发 task_updated paused', async () => {
+    const dir = createTimestampDir('tool-foreground-background/case-28-try-paused');
+
+    const state = {
+      queryStartedAt: Date.now(),
+      bashTaskId: null as string | null,
+      taskStartedToolUseId: null as string | null,
+      taskStartedAt: null as number | null,
+      // 组合动作记录
+      actions: [] as { name: string; relMs: number; result: string }[],
+      bgDone: false,
+      interruptDone: false,
+      stopDone: false,
+      // task_updated 收集
+      patchSnaps: [] as { relMs: number; status: string | undefined; patch: any }[],
+      sawPaused: false,
+      sawKilled: false,
+      distinctStatuses: [] as string[],
+      taskNotificationStatuses: [] as { relMs: number; status: string }[],
+      queryEnded: false,
+      queryEndedAt: null as number | null,
+      resultSubtype: null as string | null,
+    };
+
+    const events: CapturedSDKEvent[] = [];
+
+    // 用永挂 generator 保持 streaming 模式；靠 gate 收尾
+    const msg1: any = {
+      type: 'user',
+      message: { role: 'user', content: `Use the Bash tool to run this exact command in the BACKGROUND (set run_in_background to true): ${BG_CMD_28}. Then tell me the background task id.` },
+      parent_tool_use_id: null,
+    };
+    let resolveGate: () => void = () => {};
+    const gate = new Promise<void>((r) => { resolveGate = r; });
+    async function* promptInput(): AsyncIterable<any> {
+      yield msg1;
+      await gate; // 等我们做完所有动作后放行结束
+    }
+
+    const env = { ...BASE_ENV, OTEL_LOG_RAW_API_BODIES: `file:${dir}` };
+    const queryOptions: any = {
+      env, includePartialMessages: true, persistSession: false,
+      settingSources: [], effort: 'low', permissionMode: 'bypassPermissions',
+    };
+
+    const sdkQuery = query({ prompt: promptInput(), options: queryOptions });
+    const queryHandle: any = sdkQuery;
+
+    // 观察者驱动组合动作：task_started 后每 ~2.5s 走一个动作
+    let actionStep = 0;
+    const observer = setInterval(async () => {
+      const t = Date.now() - state.queryStartedAt;
+      console.error(`[obs t=${t}ms] taskId=${state.bashTaskId ?? '-'} step=${actionStep} paused=${state.sawPaused} killed=${state.sawKilled} patches=${state.patchSnaps.length}`);
+      if (state.bashTaskId == null || state.queryEnded) return;
+
+      // 距 task_started 至少 2s 再开始，动作之间靠 step 递进
+      if (state.taskStartedAt == null || t - state.taskStartedAt < 2000) return;
+
+      if (actionStep === 0 && !state.bgDone) {
+        actionStep = 1; state.bgDone = true;
+        const id = state.taskStartedToolUseId || undefined;
+        console.error(`\n[动作1 backgroundTasks] @ ${t}ms id=${id}`);
+        try {
+          const r = typeof queryHandle.backgroundTasks === 'function' ? await queryHandle.backgroundTasks(id) : 'NO_METHOD';
+          state.actions.push({ name: 'backgroundTasks', relMs: t, result: String(r) });
+          console.error(`[动作1] backgroundTasks → ${r}`);
+        } catch (e: any) { state.actions.push({ name: 'backgroundTasks', relMs: t, result: `ERROR: ${e?.message || e}` }); }
+      } else if (actionStep === 1 && state.bgDone && !state.interruptDone && t - state.taskStartedAt > 5000) {
+        actionStep = 2; state.interruptDone = true;
+        console.error(`\n[动作2 interrupt] @ ${t}ms`);
+        try {
+          if (typeof queryHandle.interrupt === 'function') { await queryHandle.interrupt(); state.actions.push({ name: 'interrupt', relMs: t, result: 'OK' }); }
+          else state.actions.push({ name: 'interrupt', relMs: t, result: 'NO_METHOD' });
+          console.error(`[动作2] interrupt 完成`);
+        } catch (e: any) { state.actions.push({ name: 'interrupt', relMs: t, result: `ERROR: ${e?.message || e}` }); console.error(`[动作2] interrupt 错误: ${e?.message}`); }
+      } else if (actionStep === 2 && state.interruptDone && !state.stopDone && t - state.taskStartedAt > 8000) {
+        actionStep = 3; state.stopDone = true;
+        console.error(`\n[动作3 stopTask] @ ${t}ms taskId=${state.bashTaskId}`);
+        try {
+          if (typeof queryHandle.stopTask === 'function') { await queryHandle.stopTask(state.bashTaskId!); state.actions.push({ name: 'stopTask', relMs: t, result: 'OK' }); }
+          else state.actions.push({ name: 'stopTask', relMs: t, result: 'NO_METHOD' });
+          console.error(`[动作3] stopTask 完成`);
+        } catch (e: any) { state.actions.push({ name: 'stopTask', relMs: t, result: `ERROR: ${e?.message || e}` }); }
+        // 所有动作做完，再等 2s 收尾放行
+        setTimeout(() => resolveGate(), 2000);
+      }
+    }, 1000);
+
+    let index = 0;
+    try {
+      for await (const message of sdkQuery) {
+        const msg = message as any;
+        const type = msg.type || 'unknown';
+        const rel = Date.now() - state.queryStartedAt;
+        const captured: CapturedSDKEvent = { index: index++, type, timestamp: Date.now() };
+
+        if (type === 'stream_event' && msg.event) {
+          captured.eventType = msg.event.type;
+          if (msg.event.type === 'content_block_delta' && msg.event.delta?.type === 'text_delta') {
+            process.stderr.write(msg.event.delta.text);
+          }
+        }
+
+        if (type === 'system') {
+          captured.subtype = msg.subtype;
+          if (msg.subtype === 'task_started' && !state.bashTaskId) {
+            state.bashTaskId = msg.task_id;
+            state.taskStartedToolUseId = msg.tool_use_id ?? null;
+            state.taskStartedAt = rel;
+            captured.taskId = msg.task_id;
+            captured.raw = { ...msg };
+            console.error(`\n[${rel}ms] task_started task_id=${msg.task_id} tool_use_id=${msg.tool_use_id}`);
+          }
+          if (msg.subtype === 'task_updated') {
+            const p = msg.patch || {};
+            state.patchSnaps.push({ relMs: rel, status: p.status, patch: p });
+            if (p.status === 'paused') state.sawPaused = true;
+            if (p.status === 'killed') state.sawKilled = true;
+            captured.taskId = msg.task_id;
+            captured.raw = { patch: p };
+            console.error(`\n[${rel}ms] ⚡ task_updated patch=${JSON.stringify(p)}`);
+          }
+          if (msg.subtype === 'task_notification') {
+            captured.taskId = msg.task_id;
+            captured.taskStatus = msg.status;
+            state.taskNotificationStatuses.push({ relMs: rel, status: msg.status });
+            console.error(`\n[${rel}ms] task_notification status=${msg.status}`);
+          }
+        }
+
+        if (type === 'assistant' && msg.message?.content) {
+          for (const block of msg.message.content) {
+            if (block.type === 'tool_use') { captured.toolName = block.name; captured.toolUseId = block.id; }
+          }
+        }
+
+        if (type === 'result') {
+          captured.raw = { subtype: msg.subtype, num_turns: msg.num_turns };
+          state.queryEnded = true;
+          state.queryEndedAt = rel;
+          state.resultSubtype = msg.subtype;
+          console.error(`\n[${rel}ms] result subtype=${msg.subtype}`);
+          resolveGate();
+        }
+
+        events.push(captured);
+      }
+    } catch (e: any) {
+      console.error(`\n[iterator] 抛出: ${e?.message || e}`);
+    } finally {
+      clearInterval(observer);
+      resolveGate();
+    }
+
+    const duration = Date.now() - state.queryStartedAt;
+    if (!state.queryEnded) state.queryEndedAt = duration;
+    state.distinctStatuses = [...new Set(state.patchSnaps.map(s => s.status).filter(Boolean) as string[])];
+
+    printTimeline('Case 28: 尝试触发 paused', events, duration);
+
+    console.error('\n══════ case-28 实测值（尝试触发 paused）══════');
+    console.error(`[动作序列] ${JSON.stringify(state.actions)}`);
+    console.error(`[task_updated] ${state.patchSnaps.length} 条；status 去重=${JSON.stringify(state.distinctStatuses)}`);
+    console.error(`[task_updated patches] ${JSON.stringify(state.patchSnaps)}`);
+    console.error(`[task_notification] ${JSON.stringify(state.taskNotificationStatuses)}`);
+    console.error(`[结论] 是否触发 paused: ${state.sawPaused}；是否触发 killed: ${state.sawKilled}`);
+    if (!state.sawPaused) {
+      console.error('[否定发现] 未触发 paused —— 组合 backgroundTasks+interrupt+stopTask 均未产生 paused patch。推断 paused 可能仅 TUI 暂停/特定 workflow 场景，SDK query 控制方法层无 pause 触发路径。');
+    }
+
+    writeFileSync(`${dir}/sdk-events.json`, JSON.stringify(events, null, 2));
+    writeFileSync(`${dir}/try-paused.json`, JSON.stringify({
+      actions: state.actions,
+      patchSnaps: state.patchSnaps, distinctStatuses: state.distinctStatuses,
+      sawPaused: state.sawPaused, sawKilled: state.sawKilled,
+      taskNotificationStatuses: state.taskNotificationStatuses,
+      taskStartedAt: state.taskStartedAt, bashTaskId: state.bashTaskId,
+      resultSubtype: state.resultSubtype, queryEndedAt: state.queryEndedAt, duration,
+    }, null, 2));
+
+    // ── 断言（探索性，宽松）──
+    expect(events.length).toBeGreaterThan(0);
+    if (state.bashTaskId == null) {
+      console.error('[否定发现] 未观测到 task_started（LLM 可能没起后台 bash）—— 无法尝试触发 paused');
+    }
+    // 结构断言：若有 task_updated，每条 patch 必是对象
+    for (const s of state.patchSnaps) {
+      expect(typeof s.patch).toBe('object');
     }
   }, 120000);
 });
