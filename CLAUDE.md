@@ -27,7 +27,7 @@ REST API 服务，将 `@anthropic-ai/claude-agent-sdk` 封装为 HTTP 接口。
 - `claude-code` `2.1.218`
 - `claude-code-docs` 子模块：`2026-07-25`（commit `fcfa378e`）
 
-**npm 镜像源**：项目根 `.npmrc` 固定使用淘宝镜像 `https://registry.npmmirror.com`。原因：`claude-agent-sdk` 的平台原生二进制包（如 `claude-agent-sdk-win32-x64`，解压后约 265MB）在公司私有源上下载极慢/下不动，换淘宝镜像可正常拉取。`package-lock.json` 中相关包的 `resolved` 地址也已指向淘宝镜像。
+**npm 镜像源**：项目根 `.npmrc` 固定使用淘宝镜像 `https://registry.npmmirror.com`。原因：`claude-agent-sdk` 的平台原生二进制包（如 `claude-agent-sdk-win32-x64`，解压后约 265MB）在公司私有源上下载极慢——**实测私有源限速约 24KB/s，下 81MB 耗时约 58 分钟**，正常几小时下不完，换淘宝镜像几分钟即可拉取完整 254MB。`package-lock.json` 中相关包的 `resolved` 地址也已指向淘宝镜像。装大包时若发现卡在私有源，务必确认走的是淘宝镜像。
 
 ## 命令执行约定
 
