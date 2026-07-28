@@ -226,6 +226,26 @@ streaming-input 模式，subagent 跑 `sleep 30 && echo ...`，等 `task_started
 
 **推荐**：CodePilot 实时展示 subagent 用 **A（forwardSubagentText:true）为主**——无需 persist、无需轮询、随 stream 即时到达，且每条带 `parent_tool_use_id`/`subagent_type` 便于按层级渲染嵌套会话。**B 作为补充**（需要断线重连补拉或分页查历史时用，但必须 persistSession:true）。**C 一般不用**（路径晚、要自己解析，仅离线审计场景考虑）。
 
+## Bash vs Subagent 全维度速查表
+
+一张跨维度总表，汇总两者所有已实测差异（详见各 case）：
+
+| 维度 | Bash (local_bash) | Subagent (local_agent) | 依据 |
+|------|-------------------|------------------------|------|
+| 工具调用机制 | tool_use 骨架 | **相同骨架** + 多一层子会话 | case-1/30 |
+| 进后台途径 | 3 种：显式 run_in_background / 手动 backgroundTasks / 长命令自动后台化 | 由 run_in_background 控制 | case-31 |
+| 默认模式 | 前台（短命令无 task 消息） | **默认后台** | case-5/32 |
+| 是否天生走 task 生命周期 | 否——短前台命令无 task 消息 | **是**——无论前后台都有 task_started/notification | case-1/31 |
+| 嵌套结构 | 单层 | **两层**：外层 local_agent + 内部每步 local_bash | case-34 |
+| **stopTask(taskId)** | ✅ 生效（killed+stopped） | ✅ **生效，行为一致** | case-15/26 vs 33A |
+| **backgroundTasks(toolUseId)** | ✅ 返回 **true**，可转后台 | ❌ 返回 **false**，不可转后台 | case-17 vs 33B |
+| 实时输出：SDK 事件流 | ❌ tool_result 一次性 | ❌ 同样不实时 | case-18a |
+| 实时输出：文件通道 | `.output` 文件可 tail（需后台/被自动后台化） | transcript 文件（需 persist，落盘最晚） | case-18b/19/40 vs 39 |
+| 实时输出：专用转发 | 无 | ✅ **forwardSubagentText**（最实时，首选） | case-36 |
+| 实时输出：主动拉取 | 无 | ✅ getSubagentMessages（需 persistSession） | case-38 |
+
+**四条最关键差异**：① subagent 默认后台且天生走完整 task 生命周期；② **backgroundTasks 对 Bash 有效、对 subagent 返回 false**（最易踩坑）；③ subagent 是两层嵌套 task 树；④ subagent 有专用实时通道（forwardSubagentText），Bash 只有 .output 文件。
+
 ## 关键差异：subagent vs Bash 的控制方法
 
 | 控制方法 | Bash (local_bash) | Subagent (local_agent) |
