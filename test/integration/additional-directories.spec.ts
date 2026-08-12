@@ -4,6 +4,7 @@ import dotenv from 'dotenv';
 import { readdirSync, readFileSync, existsSync } from 'fs';
 import { join, resolve } from 'path';
 import { createTimestampDir, prettyFormatJsonFiles } from './helpers';
+import { getProfileEnv } from '../llm-profiles';
 
 dotenv.config();
 
@@ -40,17 +41,7 @@ describe('自定义 skill 注入', () => {
       options: {
         cwd: PROJECT_WITH_SKILLS,
         env: {
-          ANTHROPIC_AUTH_TOKEN: process.env.ANTHROPIC_AUTH_TOKEN_LOCAL,
-          ANTHROPIC_BASE_URL: 'http://10.1.3.115:4000',
-          ANTHROPIC_DEFAULT_OPUS_MODEL: 'Jereh-LLM-NO-THINK-V1',
-          ANTHROPIC_DEFAULT_SONNET_MODEL: 'Jereh-LLM-NO-THINK-V1',
-          ANTHROPIC_DEFAULT_HAIKU_MODEL: 'Jereh-LLM-NO-THINK-V1',
-          API_TIMEOUT_MS: '3000000',
-          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
-          CLAUDE_CODE_ENABLE_TELEMETRY: '1',
-          OTEL_LOGS_EXPORTER: 'none',
-          OTEL_METRICS_EXPORTER: 'none',
-          OTEL_TRACES_EXPORTER: 'none',
+          ...getProfileEnv('local'),
           OTEL_LOG_RAW_API_BODIES: `file:${apiBodyDir}`,
         },
         includePartialMessages: true,
@@ -91,17 +82,7 @@ describe('自定义 skill 注入', () => {
       options: {
         cwd: EMPTY_PROJECT,
         env: {
-          ANTHROPIC_AUTH_TOKEN: process.env.ANTHROPIC_AUTH_TOKEN_LOCAL,
-          ANTHROPIC_BASE_URL: 'http://10.1.3.115:4000',
-          ANTHROPIC_DEFAULT_OPUS_MODEL: 'Jereh-LLM-NO-THINK-V1',
-          ANTHROPIC_DEFAULT_SONNET_MODEL: 'Jereh-LLM-NO-THINK-V1',
-          ANTHROPIC_DEFAULT_HAIKU_MODEL: 'Jereh-LLM-NO-THINK-V1',
-          API_TIMEOUT_MS: '3000000',
-          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
-          CLAUDE_CODE_ENABLE_TELEMETRY: '1',
-          OTEL_LOGS_EXPORTER: 'none',
-          OTEL_METRICS_EXPORTER: 'none',
-          OTEL_TRACES_EXPORTER: 'none',
+          ...getProfileEnv('local'),
           OTEL_LOG_RAW_API_BODIES: `file:${apiBodyDir}`,
         },
         additionalDirectories: [ADDITIONAL_DIR],

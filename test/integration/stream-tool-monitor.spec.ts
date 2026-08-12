@@ -29,6 +29,7 @@ import { AppModule } from '../../src/app.module';
 import { createTimestampDir } from './helpers';
 import { writeFileSync } from 'fs';
 import dotenv from 'dotenv';
+import { getProfileEnv } from '../llm-profiles';
 
 dotenv.config();
 
@@ -36,20 +37,7 @@ dotenv.config();
 
 // 注意：Monitor 在 DISABLE_TELEMETRY 或 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC 时不可用
 // 所以这里不设置这两个环境变量
-const BASE_ENV = {
-  ANTHROPIC_AUTH_TOKEN: process.env.ANTHROPIC_AUTH_TOKEN_LOCAL,
-  ANTHROPIC_BASE_URL: 'http://10.1.3.115:4000',
-  ANTHROPIC_DEFAULT_OPUS_MODEL: 'Jereh-LLM-NO-THINK-V1',
-  ANTHROPIC_DEFAULT_SONNET_MODEL: 'Jereh-LLM-NO-THINK-V1',
-  ANTHROPIC_DEFAULT_HAIKU_MODEL: 'Jereh-LLM-NO-THINK-V1',
-  API_TIMEOUT_MS: '3000000',
-  // 注意：不设置 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC，否则 Monitor 不可用
-  // CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
-  CLAUDE_CODE_ENABLE_TELEMETRY: '1',
-  OTEL_LOGS_EXPORTER: 'none',
-  OTEL_METRICS_EXPORTER: 'none',
-  OTEL_TRACES_EXPORTER: 'none',
-};
+const BASE_ENV = getProfileEnv('local', { overrides: { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: undefined } });
 
 // ====== 事件收集工具 ======
 
@@ -355,18 +343,7 @@ async function collectSSEEvents(
   const startTime = Date.now();
 
   // SSE 环境：不设置 DISABLE_TELEMETRY 和 DISABLE_NONESSENTIAL_TRAFFIC
-  const sseEnv = {
-    ANTHROPIC_AUTH_TOKEN: process.env.ANTHROPIC_AUTH_TOKEN_LOCAL,
-    ANTHROPIC_BASE_URL: 'http://10.1.3.115:4000',
-    ANTHROPIC_DEFAULT_OPUS_MODEL: 'Jereh-LLM-NO-THINK-V1',
-    ANTHROPIC_DEFAULT_SONNET_MODEL: 'Jereh-LLM-NO-THINK-V1',
-    ANTHROPIC_DEFAULT_HAIKU_MODEL: 'Jereh-LLM-NO-THINK-V1',
-    API_TIMEOUT_MS: '3000000',
-    CLAUDE_CODE_ENABLE_TELEMETRY: '1',
-    OTEL_LOGS_EXPORTER: 'none',
-    OTEL_METRICS_EXPORTER: 'none',
-    OTEL_TRACES_EXPORTER: 'none',
-  };
+  const sseEnv = getProfileEnv('local', { overrides: { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: undefined } });
 
   const response = await fetch(`${baseUrl}/api/query`, {
     method: 'POST',
@@ -905,18 +882,7 @@ describe('Monitor 工具 SSE 深度事件分析', () => {
   it('case-6 关闭 includePartialMessages 对比', async () => {
     const dir = createTimestampDir('stream-tool-monitor/case-6-no-partial');
 
-    const sseEnv = {
-      ANTHROPIC_AUTH_TOKEN: process.env.ANTHROPIC_AUTH_TOKEN_LOCAL,
-      ANTHROPIC_BASE_URL: 'http://10.1.3.115:4000',
-      ANTHROPIC_DEFAULT_OPUS_MODEL: 'Jereh-LLM-NO-THINK-V1',
-      ANTHROPIC_DEFAULT_SONNET_MODEL: 'Jereh-LLM-NO-THINK-V1',
-      ANTHROPIC_DEFAULT_HAIKU_MODEL: 'Jereh-LLM-NO-THINK-V1',
-      API_TIMEOUT_MS: '3000000',
-      CLAUDE_CODE_ENABLE_TELEMETRY: '1',
-      OTEL_LOGS_EXPORTER: 'none',
-      OTEL_METRICS_EXPORTER: 'none',
-      OTEL_TRACES_EXPORTER: 'none',
-    };
+    const sseEnv = getProfileEnv('local', { overrides: { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: undefined } });
 
     const requestStart = Date.now();
     const response = await fetch(`${baseUrl}/api/query`, {
