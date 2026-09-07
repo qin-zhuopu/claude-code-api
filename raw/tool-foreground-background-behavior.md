@@ -33,16 +33,16 @@
 | 59 | **无参 `backgroundTasks()` 返回 `true` 并批量后台化当前前台任务**，query 立即解除阻塞、可续轮（对应 TUI Ctrl+B） | Case 22 |
 | 60 | **本地 LLM 串行执行多条 Bash（工具层不支持并发）** —— 故批量场景实际只有 1 个前台任务在跑，无参后台化作用于「全部前台任务」= 该 1 个 | Case 22 |
 | 61 | **智谱 GLM（glm-5.2）能真正并发起 2 个前台 Bash**（同消息一次发出）—— 证实 case-22 的并发限制来自模型能力而非 SDK | Case 22b |
-| 62 | **无参 `backgroundTasks()` 一次批量转后台 2 个任务、返回 `true`** —— 首次压满「无参 = 后台化全部前台任务」的批量语义（TUI Ctrl+B）。**0.3.220 复验结论不变**（仍 2 个 task、bgCallResult=true） | Case 22b |
+| 62 | **无参 `backgroundTasks()` 一次批量转后台 2 个任务、返回 `true`** —— 首次压满「无参 = 后台化全部前台任务」的批量语义（TUI Ctrl+B）。**0.3.220 复验结论不变**（仍 2 个 task、bgCallResult=true）；0.3.263 未复验（缺凭据） | Case 22b |
 | 63 | **换模型可作控制变量隔离「模型能力 vs SDK 机制」** —— 同一代码路径本地 LLM 转 1 个、GLM 转 2 个 | Case 22b |
-| 68 | **嵌套 subagent 三 id 同源**：subagent 内部 `assistant.parent_tool_use_id` == 外层 `Agent block.id` == `task_started.tool_use_id`（三者全等）。**0.3.220 复验结论不变**（parentMatchesAgent=true） | Case 24 |
+| 68 | **嵌套 subagent 三 id 同源**：subagent 内部 `assistant.parent_tool_use_id` == 外层 `Agent block.id` == `task_started.tool_use_id`（三者全等）。**0.3.220 复验结论不变**（parentMatchesAgent=true）；0.3.263 未复验（缺凭据） | Case 24 |
 | 69 | **subagent 内部消息带 `subagent_type`（值 `general-purpose`）、`task_started` 亦带同名 subagent_type**；subagent 内部真的能再调 Bash（子 tool_use） | Case 24 |
 | 70 | **自动后台化的阻塞可被 `backgroundTasks(tool_use_id)` 解除**（自动后台化场景也返回 `true`）——沿用 case-17 铁律，等 task_started 后调即成功，无需 interrupt 兜底 | Case 25 |
 | 71 | **自动后台化任务转后台后 tool_result 带 `backgroundTaskId`（== task_id）**，第一轮 turn 立即结束（13.4s，未等满 sleep 40），可 streaming 续轮边聊 | Case 25 |
 | 72 | **显式后台 bash（run_in_background:true）能被 `stopTask` 终止**：dual-channel `task_updated.status=killed` + `task_notification.status=stopped`（相差 ~1ms），sleep 40 被真正中断 | Case 26 |
 | 73 | **`close()` 立即终止 query 迭代器**（~2s 内 for-await 退出），close 后【不再收到任何消息】——无 task_notification、无 result | Case 27 |
 | 75 | **后台 bash 跑在 git-bash(MSYS2) 里**，`$$`/`ps`/`kill`/`wmic` 全可用；SDK 不暴露 PID，须让命令 `echo $$` 自暴露 | Case 29 |
-| 76 | **`close()` 后后台 bash 进程【变孤儿、不被回收】** —— PID 硬观测：close 后持续 19s 每次 `ps -p` 探活均存活。**0.3.220 复验结论不变**（PID 28694，stillAliveAfterClose=true） | Case 27b |
+| 76 | **`close()` 后后台 bash 进程【变孤儿、不被回收】** —— PID 硬观测：close 后持续 19s 每次 `ps -p` 探活均存活。**0.3.220 复验结论不变**（PID 28694，stillAliveAfterClose=true）；0.3.263 未复验（缺凭据；changelog 2.1.257 detach 命令停止修复相关，见正文） | Case 27b |
 | 77 | **关闭会话必须先 `stopTask` 再 `close`** —— 否则后台进程成孤儿继续跑到自然结束（case-26 证明 stopTask 能真正杀进程） | Case 27b |
 | 78 | **短前台命令（echo，秒完成）【无 .output 文件】** —— 未触发自动后台化，不落盘，输出只能等 tool_result 一次性拿 | Case 40a：23 次扫 tasks 目录，从无 .output |
 | 79 | **长前台命令被自动后台化后，.output 文件在 task_started 后 ~12ms 就出现且可实时 tail** | Case 40b：firstFileExistAt−taskStartedAt=12ms，maxLines=6 实时增长 |
@@ -755,6 +755,7 @@ case-18a（`seq 1 8`，16s）测出「前台 SDK 事件流无增量 stdout」，
 ## 前台命令是否有 .output 文件 + 文件存活时长（case-40 / case-41）
 
 > 调研人：Claude Code，日期：2026-07-25（SDK 0.3.220）
+> ⚠️ 0.3.263（2026-09-08）升级后未复验（工作区缺 .env 端点凭据），结论沿用。相关 changelog：2.1.261 新增 `taskOutputMaxChars` 设置（提高后台任务输出内联上限至 128K 字符，默认行为不变，但影响「输出何时转存文件」的阈值）。
 > 目的：回答两个产品问题 —— (1) 前台任务有没有 .output 文件？(2) 后台任务文件保存多久？
 > 方法：case-40 拼 session_id+task_id 路径 existsSync 检查；case-41 量化文件从出现到被删的存活时长。
 
@@ -1064,6 +1065,10 @@ case-27 用 `.output` 文件推断孤儿失败后，改用更硬的 **PID 存活
 | 76 | **close() 后后台进程变孤儿、不被回收** | PID=`23746`；close@14442ms、迭代器结束@16594ms；close 后 15171→33498ms 共 36 次 `ps -p` 探活**全部 alive=true** |
 
 > **0.3.220 版本复验（2026-07-25）**：SDK 升级到 0.3.220 后重跑 case-27b，**结论不变**——PID=`28694`，aliveBeforeClose=true、stillAliveAfterClose=true、lastAlive=true，close 后进程依然存活到最后。changelog 提到的"后台 shell 难停止已修复（尤其 Windows）"修的应是 TUI/交互层，**不影响 SDK `query()` 的 close() 语义**——close() 依然不回收后台进程。
+>
+> ⚠️ **0.3.263 升级未复验（2026-09-08）**：SDK 升到 0.3.263（claude-code 2.1.263）。本工作区缺 `.env`（gitignore，无端点凭据），**未重跑 case-27b**，本结论按上一版（0.3.220）沿用。 changelog 中有两处与本 case 语义相关、下次有凭据时应优先复验：
+> - **2.1.257**：`Fixed background commands that detach from their shell (e.g. under timeout/setsid) surviving a task stop or Claude Code exit` —— 修的是「detach 型命令逃过 stop/exit 回收」，与本 case「close() 不回收后台进程」方向相近但场景不同（本 case 是普通 `sleep`，非 setsid），**存疑是否波及 close() 语义**。
+> - **2.1.261**：`Fixed SDK and cloud sessions ignoring a Stop or interrupt sent just after the first prompt` —— 明确点名 SDK 层 Stop/interrupt 时序，虽指 Stop 而非 close()，仍建议连带复验 case-26（stopTask 真杀进程）。
 | 77 | **close 前基线正确**：进程 close 前确实存活 | `aliveBeforeClose:true` |
 
 **关键时间线（case-27b）**：

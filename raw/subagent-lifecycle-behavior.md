@@ -3,6 +3,12 @@
 研究 `@anthropic-ai/claude-agent-sdk` 中 subagent 的工具调用机制、前后台、生命周期、实时增量。
 测试见 `test/integration/tool-foreground-background.spec.ts`（case-30 起）。
 
+> ⚠️ **0.3.263 升级未复验（2026-09-08）**：SDK 升到 0.3.263（claude-code 2.1.263）。工作区缺 `.env`（gitignore，无端点凭据），本文结论**未在新版本重跑**，全部沿用 0.3.220。下次有凭据时应优先复验以下 changelog 点名的 subagent 相关变更：
+> - **2.1.260**：`Fixed a subagent that resumed another agent via SendMessage never being woken by that agent's completion`（case-30 起的 SendMessage 唤醒链）
+> - **2.1.260**：`Fixed a session that moved to the background appearing twice in ListAgents (phantom "interactive" twin)`（case 涉及 ListAgents）
+> - **2.1.261**：`--append-subagent-system-prompt-file`（subagent system prompt 新入口，不影响默认链路但值得回归）
+> - **2.1.260**：`Improved nested background subagent results saved in the parent subagent's transcript`（与本文 transcript 读取 / 嵌套 subagent 结论直接相关）
+
 本文覆盖全部四个阶段：
 - **阶段一（是不是工具调用机制）** case-30
 - **阶段二（前后台）** case-31~33
