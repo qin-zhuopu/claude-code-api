@@ -23,9 +23,11 @@ REST API 服务，将 `@anthropic-ai/claude-agent-sdk` 封装为 HTTP 接口。
 - 升级 SDK 后，需复验受影响的观测性测试（尤其 changelog 中提到行为变更的部分，如后台任务、subagent、close 语义），确保 `raw/*-behavior.md` 的结论仍然成立，否则更新文档并标注版本。
 
 当前锁定版本：
-- `claude-agent-sdk` `0.3.220`
-- `claude-code` `2.1.218`
-- `claude-code-docs` 子模块：`2026-07-25`（commit `fcfa378e`）
+- `claude-agent-sdk` `0.3.263`
+- `claude-code` `2.1.263`
+- `claude-code-docs` 子模块：`2026-09-07`（commit `541cf3a0`）
+
+> ⚠️ **2026-09-08 升级待复验**：本次升级到 0.3.263 时工作区缺 `.env`（LLM 端点凭据，已 gitignore），**受影响的观测性测试未重跑**，`raw/*-behavior.md` 结论按 0.3.220 沿用。已在 `tool-foreground-background-behavior.md`（case-22b/24/27b/40/41）与 `subagent-lifecycle-behavior.md` 顶部标注 changelog 点名、下次有凭据须复验的条目（close/stop 语义、SendMessage 唤醒、ListAgents 幽灵行等）。补齐凭据后请优先复验并解除标注。
 
 **npm 镜像源**：项目根 `.npmrc` 固定使用淘宝镜像 `https://registry.npmmirror.com`。原因：`claude-agent-sdk` 的平台原生二进制包（如 `claude-agent-sdk-win32-x64`，解压后约 265MB）在公司私有源上下载极慢——**实测私有源限速约 24KB/s，下 81MB 耗时约 58 分钟**，正常几小时下不完，换淘宝镜像几分钟即可拉取完整 254MB。`package-lock.json` 中相关包的 `resolved` 地址也已指向淘宝镜像。装大包时若发现卡在私有源，务必确认走的是淘宝镜像。
 
