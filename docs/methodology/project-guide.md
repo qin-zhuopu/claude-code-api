@@ -259,6 +259,7 @@ Select-String -Path "test\integration\tmp\**\*.request.json" -Pattern "greet|jok
 | `otel-log-options.spec.ts` | `otel-log-options-behavior.md` |
 | `conn-retry.spec.ts` | `conn-retry-behavior.md` |
 | `agent-shared-mechanism.spec.ts` | `agent-shared-mechanism-behavior.md` |
+| `agents-md-autoload.spec.ts` | `agents-md-autoload-behavior.md` |
 | `query-user-interaction.spec.ts` | `tool-user-interaction-behavior.md` |
 | `hook-pre-tool-use.spec.ts` | `hook-pre-tool-use-behavior.md` |
 | `stream-event-types.spec.ts` | `stream-event-types-behavior.md` |
@@ -319,6 +320,7 @@ Select-String -Path "test\integration\tmp\**\*.request.json" -Pattern "greet|jok
 | `raw/tool-ask-user-question-behavior.md` | AskUserQuestion 工具行为的双环境交叉对比实验 |
 | `raw/conn-retry-behavior.md` | SDK 自动重试行为（连接失败/超时/错误时的重试策略、参数、退避算法） |
 | `raw/agent-shared-mechanism-behavior.md` | CLI 与 SDK 的 Agent 共享机制（filesystem vs programmatic agent 行为差异） |
+| `raw/agents-md-autoload-behavior.md` | `.claude/agents/*.md` 是否自动进 system prompt（5 组实验）：结论 = agent md 正文**不进** system prompt，仅以 name+description 摘要一行进对话上下文的 role=system reminder（Available agent types 清单），受 settingSources 含 'project' 门控，preset claude_code 下结论不变（system 6923 字符仍不含 agent），编程式 agents 同理 |
 | `raw/tool-user-interaction-behavior.md` | SDK 工具-用户交互机制全景（权限确认、AskUserQuestion、MCP Elicitation、User Dialog、多轮对话） |
 | `raw/hook-pre-tool-use-behavior.md` | SDK Hook PreToolUse 机制（参数获取、deny 拦截、updatedInput 修改、多 hook 优先级、master agent 直接使用） |
 | `raw/stream-event-types-behavior.md` | SDK 流式事件类型全景（27 种消息类型、stream_event 内部结构、工具调用事件流、Vue3+Element Plus 渲染方案） |
